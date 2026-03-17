@@ -107,43 +107,55 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   const $ = cheerio.load(html);
   const matches: any[] = [];
 
-  // Find all links that look like match scorecards
+  // Find all links to live cricket scores that are match cards
   $("a[href*='/live-cricket-scores/']").each((i, el) => {
     const link = $(el).attr('href');
     const matchId = link ? link.split('/')[2] : null;
     if (!matchId) return;
 
-    // Get all text inside the link to guess teams/result
-    const text = $(el).text().replace(/\s+/g, ' ').trim();
-    console.log(`[series] Candidate ${i}: ID=${matchId}, text="${text.substring(0,100)}..."`);
+    // Check if it's a match card by looking for the inner div structure
+    const cardDiv = $(el).find('div.border-b.p-4');
+    if (cardDiv.length === 0) return;
 
-    // Try to extract teams (simple heuristic)
-    let teams = '';
-    const teamMatch = text.match(/(New Zealand|South Africa|NZ|RSA)\s+(?:vs|VS)\s+(New Zealand|South Africa|NZ|RSA)/i);
-    if (teamMatch) teams = teamMatch[0];
+    // Extract match number and venue
+    const matchDescEl = cardDiv.find('p.font-bold span').first();
+    const matchDesc = matchDescEl.text().trim();
+    const venueEl = cardDiv.find('span.text-gray-500.text-xs.ml-1');
+    const venue = venueEl.text().trim();
 
-    // Try to extract result
-    let result = '';
-    const resultMatch = text.match(/(New Zealand|South Africa)\s+won\s+by\s+[\d\s]+(runs|wkts)/i);
-    if (resultMatch) result = resultMatch[0];
+    // Extract teams and scores
+    const teamNameDivs = cardDiv.find('div.font-semibold');
+    const scoreDivs = cardDiv.find('div.text-gray-700.text-sm');
+    const team1 = teamNameDivs.first().text().trim();
+    const team2 = teamNameDivs.last().text().trim();
+    const score1 = scoreDivs.first().text().trim();
+    const score2 = scoreDivs.last().text().trim();
 
-    // Try to extract venue
-    let venue = '';
-    const venueMatch = text.match(/•\s*([^•]+?)(?:\d|$)/);
-    if (venueMatch) venue = venueMatch[1].trim();
+    // Extract result/status
+    const resultEl = cardDiv.find('p.text-\\[#a36501\\]');
+    const result = resultEl.text().trim();
 
-    // Date might be nearby – we'll leave blank for now
-    const date = '';
+    // Build teams string
+    const teams = team1 && team2 ? `${team1} vs ${team2}` : '';
+
+    // Log for debugging
+    console.log(`[series] Found match: ID=${matchId}, teams=${teams}, result=${result}, venue=${venue}`);
 
     if (matchId && teams) {
-      matches.push({ matchId, teams, result, venue, date });
-      console.log(`[series] Added: ${teams} (${result})`);
+      matches.push({
+        matchId,
+        teams,
+        result,
+        venue,
+        date: '', // Date not directly available in card; can be enhanced later
+      });
     }
   });
 
   console.log(`[series] Total matches extracted: ${matches.length}`);
   return matches;
 };
+
 
 // ── Fetch full scorecard (also uses Puppeteer) ────────────
 const fetchScorecard = async (matchId: string): Promise<any> => {
