@@ -58,42 +58,70 @@ const fetchLiveMatches = async (): Promise<any[]> => {
   const url = "https://www.cricbuzz.com/cricket-match/live-scores";
   const html = await fetchHTMLWithBrowser(url);
   const $ = cheerio.load(html);
-
   const matches: any[] = [];
+  const seenIds = new Set<string>();
 
-  $(".cb-mtch-lst.cb-col.cb-col-100").each((index, element) => {
-    const matchElement = $(element);
-    const link = matchElement.find("a.cb-lv-scrs-well").attr("href");
-    const id = link ? link.split("/")[2] : null;
+  // New Cricbuzz UI uses Tailwind — find match links
+  $("a[href*='/live-cricket-scores/']").each((i, el) => {
+    const link = $(el).attr('href') || '';
+    const parts = link.split('/');
+    const matchId = parts[2];
+    if (!matchId || seenIds.has(matchId)) return;
+    seenIds.add(matchId);
 
-    const teams: string[] = [];
-    matchElement.find(".cb-ovr-flo .cb-hmscg-tm-nm").each((i, el) => {
-      teams.push($(el).text().trim());
-    });
-
-    const status = matchElement.find(".cb-text-live, .cb-text-complete, .cb-text-rain, .cb-text-abandon")
-      .first().text().trim() || "Upcoming";
-
-    const venue = matchElement.find(".cb-venue").text().trim();
-
-    const scores: string[] = [];
-    matchElement.find(".cb-ovr-flo .cb-scrs-wrp").each((i, el) => {
-      scores.push($(el).text().trim());
-    });
-
-    if (id && teams.length >= 2) {
-      matches.push({
-        id,
-        team1: teams[0],
-        team2: teams[1],
-        status,
-        venue,
-        score: scores,
-        matchType: "T20",
-      });
+    // Walk up to find card container
+    let card = $(el);
+    for (let d = 0; d < 5; d++) {
+      card = card.parent();
+      if (card.find('a[href*="/live-cricket-scores/"]').length === 1) break;
     }
+
+    // Extract teams from URL slug — most reliable
+    const slug = parts[3] || '';
+    const vsIdx = slug.indexOf('-vs-');
+    let team1 = '', team2 = '';
+    if (vsIdx > -1) {
+      team1 = slug.substring(0, vsIdx).replace(/-/g, ' ').replace(/\w/g, (c: string) => c.toUpperCase());
+      team2 = slug.substring(vsIdx + 4).split('-').slice(0, 3).join(' ').replace(/\w/g, (c: string) => c.toUpperCase());
+    }
+
+    // Extract status from text — look for LIVE, innings info
+    const cardText = card.text().trim();
+    const status = cardText.includes('live') || cardText.toLowerCase().includes('live') ? 'live' : 'upcoming';
+
+    // Extract score — look for patterns like "142/4" or "186/6"
+    const scoreMatches = cardText.match(/[0-9]{1,3}\/[0-9]{1,2}/g) || [];
+    const score: any[] = scoreMatches.map((s: string) => {
+      const [r, w] = s.split('/');
+      return { r: parseInt(r), w: parseInt(w), o: '0.0', inning: '' };
+    });
+
+    // Extract venue — look for short non-numeric text in spans
+    let venue = '';
+    card.find('span, p').each((_: number, el: any) => {
+      if (venue) return false;
+      const txt = $(el).text().trim();
+      if (txt && txt.length > 3 && txt.length < 50 &&
+          !/[0-9]/.test(txt) &&
+          !/log.?in|sign|menu|advert|live|upcoming|schedule/i.test(txt)) {
+        venue = txt;
+        return false;
+      }
+    });
+
+    matches.push({
+      id: matchId,
+      team1: team1 || 'TBD',
+      team2: team2 || 'TBD',
+      teams: [team1, team2].filter(Boolean),
+      status,
+      venue,
+      score,
+      matchType: 'T20',
+    });
   });
 
+  console.log(`[live] Found ${matches.length} matches`);
   return matches;
 };
 
@@ -107,32 +135,14 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   try {
     html = await fetchHTMLWithBrowser(url);
   } catch (err) {
-    console.error(`[series] Browser fetch failed:`, err);
+    console.error('[series] Fetch failed:', err);
     return [];
   }
 
   const $ = cheerio.load(html);
-
-  // Detect login wall — if page has login form, Cricbuzz blocked us
-  const isLoginWall = $('input[type="password"]').length > 0 ||
-    $('*:contains("Log In")').length > 5 ||
-    html.includes('cb-login') ||
-    html.length < 5000;
-
-  if (isLoginWall) {
-    console.log(`[series] Login wall detected — HTML length: ${html.length}`);
-    // Try alternate URL format
-    try {
-      html = await fetchHTMLWithBrowser(`https://www.cricbuzz.com/cricket-series/${seriesId}/`);
-    } catch (e) {
-      return [];
-    }
-  }
-
   const matches: any[] = [];
   const seenIds = new Set<string>();
 
-  // Strategy 1: Find match links with /live-cricket-scores/
   $("a[href*='/live-cricket-scores/']").each((i, el) => {
     const link = $(el).attr('href') || '';
     const parts = link.split('/');
@@ -140,47 +150,43 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
     if (!matchId || seenIds.has(matchId)) return;
     seenIds.add(matchId);
 
-    // Get the full text content of the nearest substantial parent
-    let container = $(el);
-    for (let depth = 0; depth < 6; depth++) {
-      container = container.parent();
-      if (container.text().trim().length > 30) break;
-    }
-
-    const fullText = container.text().trim();
-
-    // Extract teams from URL slug (most reliable)
-    let teams = '';
+    // Teams from URL slug
     const slug = parts[3] || '';
     const vsIdx = slug.indexOf('-vs-');
+    let team1 = '', team2 = '';
     if (vsIdx > -1) {
-      const t1 = slug.substring(0, vsIdx).split('-').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-      const t2 = slug.substring(vsIdx + 4).split('-')[0].split('-').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-      teams = `${t1} vs ${t2}`;
+      team1 = slug.substring(0, vsIdx).replace(/-/g, ' ').replace(/\w/g, (c: string) => c.toUpperCase());
+      team2 = slug.substring(vsIdx + 4).split('-').slice(0, 3).join(' ').replace(/\w/g, (c: string) => c.toUpperCase());
+    }
+    const teams = team1 && team2 ? `${team1} vs ${team2}` : slug;
+
+    // Walk up to card
+    let card = $(el);
+    for (let d = 0; d < 6; d++) {
+      card = card.parent();
+      if (card.text().trim().length > 20) break;
     }
 
-    // Extract result from full text using regex
+    const cardText = card.text().replace(/\s+/g, ' ').trim();
+
+    // Extract result
     let result = '';
-    const resultMatch = fullText.match(/([A-Z][a-zA-Z ]+(?:won by [0-9]+[^,]{0,40}|tied|drawn|no result|abandoned))/);
-    if (resultMatch) {
-      result = resultMatch[1].trim();
-    }
+    const resultRe = /([A-Za-z][a-zA-Z ]+ (?:won by [0-9]+ (?:runs?|wickets?|wkts?)|tied|drawn|no result|abandoned))/i;
+    const rm = cardText.match(resultRe);
+    if (rm) result = rm[1].trim();
 
-    // Extract venue — look for city names or ground names
-    // Venue is usually a short text NOT containing result keywords
+    // Extract venue — find city/ground name
     let venue = '';
-    container.find('span, div, p').each((_i: number, el: any) => {
+    card.find('span, div, p').each((_: number, el: any) => {
       if (venue) return false;
-      const children = $(el).children().length;
-      if (children > 2) return; // skip containers
+      if ($(el).children().length > 0) return;
       const txt = $(el).text().trim();
-      // Venue: short, no digits, not a login/nav element, not result text
       if (txt &&
           txt.length > 3 &&
           txt.length < 40 &&
-          !/\d/.test(txt) &&
-          !/log in|sign|register|name:|live|qualifier|upcoming|completed/i.test(txt) &&
-          !/won by|tied|drawn|no result/i.test(txt)) {
+          !/[0-9\/]/.test(txt) &&
+          !/log.?in|sign|menu|name:|live|qualifier|upcoming|schedule|won|tied|drawn/i.test(txt) &&
+          !/^(T20|ODI|Test|Women|Men|Match|Series|vs|and|the|of|in)$/i.test(txt)) {
         venue = txt;
         return false;
       }
@@ -188,30 +194,15 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
 
     // Extract date
     let date = '';
-    const dateMatch = fullText.match(/(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}|\d{4}-\d{2}-\d{2})/i);
-    if (dateMatch) date = dateMatch[1];
+    const dateRe = /([0-9]{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* [0-9]{4})/i;
+    const dm = cardText.match(dateRe);
+    if (dm) date = dm[1];
 
     console.log(`[series] ID=${matchId} teams="${teams}" result="${result}" venue="${venue}"`);
     matches.push({ matchId, teams, score1: '', score2: '', result, venue, date });
   });
 
-  // Strategy 2: if no matches found via links, try cb-series-matches class
-  if (matches.length === 0) {
-    console.log('[series] No matches via links — trying cb selectors');
-    $('.cb-series-matches, .cb-col-100.cb-series-brdr').each((i, el) => {
-      const link = $(el).find('a[href*="/live-cricket-scores/"]').first().attr('href') || '';
-      const matchId = link.split('/')[2];
-      if (!matchId || seenIds.has(matchId)) return;
-      seenIds.add(matchId);
-
-      const teams = $(el).find('.cb-hmscg-tm-nm').map((_: number, t: any) => $(t).text().trim()).get().join(' vs ');
-      const result = $(el).find('.cb-text-complete, .cb-text-live').first().text().trim();
-      const venue = $(el).find('.cb-venue').first().text().trim();
-      matches.push({ matchId, teams, score1: '', score2: '', result, venue, date: '' });
-    });
-  }
-
-  console.log(`[series] Total: ${matches.length} matches`);
+  console.log(`[series] Total: ${matches.length}`);
   return matches;
 };
 
@@ -369,41 +360,6 @@ app.get(
     } catch (err) {
       console.error("[debug] Error fetching HTML:", err);
       res.status(500).send("Error fetching HTML: " + (err instanceof Error ? err.message : String(err)));
-    }
-  })
-);
-
-// ── Debug: view raw live scores HTML ─────────────────────
-app.get(
-  "/debug/live/html",
-  asyncHandler(async (req: Request, res: Response) => {
-    try {
-      const html = await fetchHTMLWithBrowser("https://www.cricbuzz.com/cricket-match/live-scores");
-      res.setHeader('Content-Type', 'text/html');
-      res.send(html);
-    } catch (err) {
-      res.status(500).send("Error: " + (err instanceof Error ? err.message : String(err)));
-    }
-  })
-);
-
-// ── Debug: check what selectors are matched ───────────────
-app.get(
-  "/debug/live/selectors",
-  asyncHandler(async (req: Request, res: Response) => {
-    try {
-      const html = await fetchHTMLWithBrowser("https://www.cricbuzz.com/cricket-match/live-scores");
-      const $ = cheerio.load(html);
-      const debug = {
-        total_cb_mtch: $(".cb-mtch-lst").length,
-        total_cb_col_100: $(".cb-col-100").length,
-        total_links: $("a[href*='/live-cricket-scores/']").length,
-        total_live_well: $("a.cb-lv-scrs-well").length,
-        sample_html: $("body").html()?.substring(0, 2000) || 'empty',
-      };
-      res.json(debug);
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
     }
   })
 );
