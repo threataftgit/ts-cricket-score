@@ -79,9 +79,9 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 
 
 // ── NEW: Fetch series matches (completed/upcoming) ────────
-
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
-  const url = `https://www.cricbuzz.com/cricket-series/${seriesId}`;
+  // Use the matches page URL
+  const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
   console.log(`[series] Fetching URL: ${url}`);
   const html = await fetchHTML(url);
   const $ = cheerio.load(html);
@@ -92,18 +92,19 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
     // Extract match ID from the link
     const link = $(el).find("a[href*='/live-cricket-scores/']").attr("href");
     const matchId = link ? link.split("/")[2] : null;
-    
-    // Extract teams – inside <p class="font-bold">
+
+    // Teams – inside <p class="font-bold">
     const teams = $(el).find("p.font-bold").text().trim();
-    
-    // Extract venue – inside <span class="text-gray-500 text-xs ml-1">
+
+    // Venue – inside <span class="text-gray-500 text-xs ml-1">
     const venue = $(el).find("span.text-gray-500.text-xs.ml-1").text().trim();
-    
-    // Extract result – inside <p class="text-[#a36501]">
+
+    // Result – inside <p class="text-[#a36501]"> (escape brackets)
     const result = $(el).find("p.text-\\[#a36501\\]").text().trim();
-    
-    // Extract date – may be in a separate element; if not found, leave blank
-    const date = $(el).find("span.text-xs").first().text().trim() || ""; // adjust as needed
+
+    // Date – try to find any nearby element with date info
+    // Often it's in a small text above the teams; adjust as needed
+    const date = $(el).find("div.text-xs.text-gray-500").first().text().trim() || "";
 
     console.log(`[series] Found match: id=${matchId}, teams=${teams}, result=${result}, venue=${venue}, date=${date}`);
 
@@ -121,6 +122,7 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   console.log(`[series] Total matches extracted: ${matches.length}`);
   return matches;
 };
+
 
 // ── NEW: Fetch full scorecard for a match ─────────────────
 const fetchScorecard = async (matchId: string): Promise<any> => {
