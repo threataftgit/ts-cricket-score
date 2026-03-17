@@ -181,11 +181,11 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
       // Only look at leaf-level or near-leaf elements to avoid concatenated text
       if (children.length > 3) return;
       const txt = $(resEl).text().trim();
-      if (txt && /won by|tied|no result|drawn|abandoned/i.test(txt)) {
+      if (txt && /won by|wkts|wickets|tied|no result|drawn|abandoned|innings/i.test(txt)) {
         // Extract ONLY the result sentence using regex
         const match = txt.match(/((?:[A-Za-z][\w\s]*?)\s+(?:won by[\w\s,]+|tied|no result|drawn|abandoned[^.]*?)(?:[.]|$))/i);
         if (match) {
-          result = match[1].trim();
+          result = match[1].trim().replace(/More Matches.*/i, '').trim();
         } else {
           // Fallback: extract from "won by" onwards
           const wonIdx = txt.search(/won by|tied|no result|drawn|abandoned/i);
@@ -197,7 +197,10 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
             const afterText = txt.substring(wonIdx);
             const newlineIdx = afterText.indexOf(' ');
             const cleanAfter = afterText.split(' ').slice(0, 8).join(' ');
-            result = (teamPart + cleanAfter).trim();
+            result = (teamPart + cleanAfter).trim()
+              .replace(/More Matches.*/i, '')
+              .replace(/\s+/g, ' ')
+              .trim();
           }
         }
         return false;
@@ -206,23 +209,27 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
 
     // ── Extract venue ─────────────────────────────────────
     let venue = '';
-    cardDiv.find('span[class*="gray"], span[class*="text-xs"], .cb-venue').each((_i: number, venEl: any) => {
-      if (venue) return false;
-      const txt = $(venEl).text().trim();
-      if (txt && txt.length > 2 && txt.length < 50 && !/\d{1,2}:\d{2}|GMT|IST/.test(txt)) {
-        venue = txt; return false;
-      }
+    // Extract venue and date from separate elements
+    const allSpans: string[] = [];
+    cardDiv.find('span, div[class*="gray"], div[class*="text-xs"]').each((_i: number, venEl: any) => {
+      const txt = $(venEl).children().length === 0 ? $(venEl).text().trim() : '';
+      if (txt && txt.length > 2 && txt.length < 80) allSpans.push(txt);
     });
 
-    // ── Extract date ──────────────────────────────────────
-    let date = '';
-    cardDiv.find('span[class*="gray"], span[class*="text-xs"]').each((_i: number, dtEl: any) => {
-      if (date) return false;
-      const txt = $(dtEl).text().trim();
-      if (txt && /\d{1,2}:\d{2}|GMT|IST|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/i.test(txt)) {
-        date = txt; return false;
+    // Venue = first span that looks like a city/ground (no digits, no time)
+    for (const span of allSpans) {
+      if (!/[0-9]/.test(span) && span.length < 40 && !venue) {
+        venue = span.replace(/More Matches.*/i, '').trim();
       }
-    });
+    }
+
+    // Date = first span that contains time or month
+    let date = '';
+    for (const span of allSpans) {
+      if (/\d{1,2}:\d{2}|GMT|IST|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/i.test(span) && !date) {
+        date = span.replace(/More Matches.*/i, '').trim();
+      }
+    }
 
     console.log(`[series] ID=${matchId} teams="${teams}" result="${result}" venue="${venue}"`);
     matches.push({ matchId, teams, score1, score2, result, venue, date });
