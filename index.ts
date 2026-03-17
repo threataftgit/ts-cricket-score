@@ -56,7 +56,7 @@ const fetchHTMLWithBrowser = async (url: string): Promise<string> => {
 // ── Fetch live matches (still uses axios, seems fine) ─────
 const fetchLiveMatches = async (): Promise<any[]> => {
   const url = "https://www.cricbuzz.com/cricket-match/live-scores";
-  const html = await fetchHTML(url);
+  const html = await fetchHTMLWithBrowser(url);
   const $ = cheerio.load(html);
 
   const matches: any[] = [];
@@ -386,6 +386,41 @@ app.get(
     } catch (err) {
       console.error("[debug] Error fetching HTML:", err);
       res.status(500).send("Error fetching HTML: " + (err instanceof Error ? err.message : String(err)));
+    }
+  })
+);
+
+// ── Debug: view raw live scores HTML ─────────────────────
+app.get(
+  "/debug/live/html",
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const html = await fetchHTMLWithBrowser("https://www.cricbuzz.com/cricket-match/live-scores");
+      res.setHeader('Content-Type', 'text/html');
+      res.send(html);
+    } catch (err) {
+      res.status(500).send("Error: " + (err instanceof Error ? err.message : String(err)));
+    }
+  })
+);
+
+// ── Debug: check what selectors are matched ───────────────
+app.get(
+  "/debug/live/selectors",
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const html = await fetchHTMLWithBrowser("https://www.cricbuzz.com/cricket-match/live-scores");
+      const $ = cheerio.load(html);
+      const debug = {
+        total_cb_mtch: $(".cb-mtch-lst").length,
+        total_cb_col_100: $(".cb-col-100").length,
+        total_links: $("a[href*='/live-cricket-scores/']").length,
+        total_live_well: $("a.cb-lv-scrs-well").length,
+        sample_html: $("body").html()?.substring(0, 2000) || 'empty',
+      };
+      res.json(debug);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
     }
   })
 );
