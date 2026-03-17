@@ -45,7 +45,6 @@ const fetchHTMLWithBrowser = async (url: string): Promise<string> => {
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-    // Wait for actual content to appear (not the Cloudflare challenge)
     await page.waitForSelector('.cb-col', { timeout: 10000 }).catch(() => {});
     const html = await page.content();
     return html;
@@ -99,11 +98,19 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 };
 
 // ── Fetch series matches (uses Puppeteer) ─────────────────
-
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
   console.log(`[series] Fetching URL: ${url}`);
-  const html = await fetchHTMLWithBrowser(url);
+
+  let html: string;
+  try {
+    html = await fetchHTMLWithBrowser(url);
+    console.log(`[series] HTML fetched, length: ${html.length}`);
+  } catch (err) {
+    console.error(`[series] Error fetching HTML:`, err);
+    return [];
+  }
+
   const $ = cheerio.load(html);
   const matches: any[] = [];
 
@@ -156,8 +163,7 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   return matches;
 };
 
-
-// ── Fetch full scorecard (also uses Puppeteer) ────────────
+// ── Fetch full scorecard for a match ─────────────────
 const fetchScorecard = async (matchId: string): Promise<any> => {
   const url = `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}/nz-vs-sa`;
   const html = await fetchHTMLWithBrowser(url);
@@ -294,6 +300,7 @@ app.get(
   })
 );
 
+// ── Debug endpoint to view raw HTML ───────────────────────
 app.get(
   "/debug/series/:seriesId/html",
   asyncHandler(async (req: Request, res: Response) => {
@@ -304,8 +311,8 @@ app.get(
       res.setHeader('Content-Type', 'text/html');
       res.send(html);
     } catch (err) {
-      console.error("[debug] Error:", err);
-      res.status(500).send("Error: " + err.message);
+      console.error("[debug] Error fetching HTML:", err);
+      res.status(500).send("Error fetching HTML: " + (err instanceof Error ? err.message : String(err)));
     }
   })
 );
