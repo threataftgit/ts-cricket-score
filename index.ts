@@ -161,8 +161,7 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
 
     // Extract result from full text using regex
     let result = '';
-    const resultMatch = fullText.match(/([A-Z][a-zA-Z\s]+(?:won by \d+[^,
-]{0,40}|tied|drawn|no result|abandoned))/);
+    const resultMatch = fullText.match(/([A-Z][a-zA-Z ]+(?:won by [0-9]+[^,]{0,40}|tied|drawn|no result|abandoned))/);
     if (resultMatch) {
       result = resultMatch[1].trim();
     }
