@@ -98,6 +98,7 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 };
 
 // ── Fetch series matches (uses Puppeteer) ─────────────────
+
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
   console.log(`[series] Fetching URL: ${url}`);
@@ -135,8 +136,9 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
     const score1 = scoreDivs.first().text().trim();
     const score2 = scoreDivs.last().text().trim();
 
-    // Extract result/status (the only paragraph in the card)
-    const result = cardDiv.find('p').first().text().trim();
+    // Extract result/status from the paragraph with class text-[#a36501]
+    const resultEl = cardDiv.find('p.text-\\[#a36501\\]');
+    const result = resultEl.text().trim();
 
     // Extract venue
     const venueEl = cardDiv.find('span.text-gray-500.text-xs.ml-1');
@@ -152,7 +154,6 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   console.log(`[series] Total matches extracted: ${matches.length}`);
   return matches;
 };
-
 
 
 
