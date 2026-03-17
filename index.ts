@@ -33,6 +33,58 @@ const fetchHTML = async (url: string): Promise<string> => {
   }
 };
 
+// NEW: Fetch live matches list from Cricbuzz
+const fetchLiveMatches = async (): Promise<any[]> => {
+  const url = "https://www.cricbuzz.com/cricket-match/live-scores";
+  const html = await fetchHTML(url);
+  const $ = cheerio.load(html);
+
+  const matches: any[] = [];
+
+  // Each live match is typically inside a <div> with class "cb-mtch-lst cb-col cb-col-100"
+  $(".cb-mtch-lst.cb-col.cb-col-100").each((index, element) => {
+    const matchElement = $(element);
+
+    // Extract match ID from the link
+    const link = matchElement.find("a.cb-lv-scrs-well").attr("href");
+    const id = link ? link.split("/")[2] : null; // e.g., "/live-cricket-scores/12345" → "12345"
+
+    // Team names
+    const teams: string[] = [];
+    matchElement.find(".cb-ovr-flo .cb-hmscg-tm-nm").each((i, el) => {
+      teams.push($(el).text().trim());
+    });
+
+    // Status (e.g., "Live", "Stumps", etc.)
+    const status = matchElement.find(".cb-text-live, .cb-text-complete, .cb-text-rain, .cb-text-abandon")
+      .first().text().trim() || "Upcoming";
+
+    // Venue (optional)
+    const venue = matchElement.find(".cb-venue").text().trim();
+
+    // Score lines – often multiple innings
+    const scores: string[] = [];
+    matchElement.find(".cb-ovr-flo .cb-scrs-wrp").each((i, el) => {
+      scores.push($(el).text().trim());
+    });
+
+    // Build match object
+    if (id && teams.length >= 2) {
+      matches.push({
+        id,
+        team1: teams[0],
+        team2: teams[1],
+        status,
+        venue,
+        score: scores, // e.g., ["289/10", "45/0"]
+        matchType: "T20", // You can try to detect from series name if needed
+      });
+    }
+  });
+
+  return matches;
+};
+
 const parseCricketScore = ($: cheerio.CheerioAPI): Record<string, string> => {
     const getText = (selector: string): string =>
       $(selector).first().text().trim() || "Match Stats will Update Soon";
@@ -92,6 +144,20 @@ app.get(
     const $ = cheerio.load(html);
     const matchData = parseCricketScore($);
     res.json(matchData);
+  })
+);
+
+// NEW: Live matches endpoint
+app.get(
+  "/live",
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const liveMatches = await fetchLiveMatches();
+      res.json(liveMatches);
+    } catch (err) {
+      console.error("Error fetching live matches:", err);
+      res.status(500).json({ error: "Failed to fetch live matches" });
+    }
   })
 );
 
