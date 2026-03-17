@@ -61,7 +61,6 @@ const fetchLiveMatches = async (): Promise<any[]> => {
   const matches: any[] = [];
   const seenIds = new Set<string>();
 
-  // New Cricbuzz UI uses Tailwind — find match links
   $("a[href*='/live-cricket-scores/']").each((i, el) => {
     const link = $(el).attr('href') || '';
     const parts = link.split('/');
@@ -69,41 +68,65 @@ const fetchLiveMatches = async (): Promise<any[]> => {
     if (!matchId || seenIds.has(matchId)) return;
     seenIds.add(matchId);
 
-    // Walk up to find card container
-    let card = $(el);
-    for (let d = 0; d < 5; d++) {
-      card = card.parent();
-      if (card.find('a[href*="/live-cricket-scores/"]').length === 1) break;
-    }
-
-    // Extract teams from URL slug — most reliable
+    // Extract teams from URL slug — strip match descriptor after team code
     const slug = parts[3] || '';
     const vsIdx = slug.indexOf('-vs-');
     let team1 = '', team2 = '';
     if (vsIdx > -1) {
-      team1 = slug.substring(0, vsIdx).replace(/-/g, ' ').replace(/\w/g, (c: string) => c.toUpperCase());
-      team2 = slug.substring(vsIdx + 4).split('-').slice(0, 3).join(' ').replace(/\w/g, (c: string) => c.toUpperCase());
+      // team1: everything before -vs-
+      // team2: everything after -vs- but stop at first match-type word
+      const rawT1 = slug.substring(0, vsIdx);
+      const rawT2 = slug.substring(vsIdx + 4);
+      // Strip match descriptors: -1st, -2nd, -3rd, -4th, -5th, -final, -semi, -qualifier
+      const stripDesc = (s: string) => s
+        .replace(/-[0-9].*$/, '')
+        .replace(/-(?:final|semi|quarter|qualifier|warm|practice|tour|series|of|the|and).*$/i, '');
+      team1 = stripDesc(rawT1).toUpperCase();
+      team2 = stripDesc(rawT2).toUpperCase();
     }
 
-    // Extract status from text — look for LIVE, innings info
-    const cardText = card.text().trim();
-    const status = cardText.includes('live') || cardText.toLowerCase().includes('live') ? 'live' : 'upcoming';
+    // Get the immediate link text — often has match status
+    const linkText = $(el).text().trim();
 
-    // Extract score — look for patterns like "142/4" or "186/6"
-    const scoreMatches = cardText.match(/[0-9]{1,3}\/[0-9]{1,2}/g) || [];
-    const score: any[] = scoreMatches.map((s: string) => {
-      const [r, w] = s.split('/');
-      return { r: parseInt(r), w: parseInt(w), o: '0.0', inning: '' };
-    });
+    // Walk up carefully — only 1-2 levels to stay within this match card
+    const card = $(el).parent().parent();
+    const cardText = card.text().replace(/\s+/g, ' ').trim().substring(0, 500);
 
-    // Extract venue — look for short non-numeric text in spans
+    // Status — check if any text indicates live
+    const isLive = /live|batting|bowling|(?:[0-9]+\/[0-9]+)/i.test(cardText);
+
+    // Score — look for cricket score patterns in TEXT nodes only
+    // Valid cricket score: 3 digits max / 1-2 digits, e.g. 175/6, 107/10
+    // Reject CSS dimensions like 300/250, 728/90
+    const scorePattern = /([0-9]{1,3})\/([0-9]{1,2})/g;
+    const scores: any[] = [];
+    let sm: RegExpExecArray | null;
+    const textOnly = card.find('*').map((_: number, el: any) => {
+      // Only get text from leaf nodes (no children)
+      if ($(el).children().length === 0) return $(el).text().trim();
+      return '';
+    }).get().join(' ');
+
+    while ((sm = scorePattern.exec(textOnly)) !== null) {
+      const runs = parseInt(sm[1]);
+      const wkts = parseInt(sm[2]);
+      // Valid cricket: runs 0-500, wickets 0-10
+      if (runs <= 500 && wkts <= 10) {
+        scores.push({ r: runs, w: wkts, o: '0.0', inning: '' });
+        if (scores.length >= 2) break;
+      }
+    }
+
+    // Venue — find short leaf-node text that looks like a ground/city
     let venue = '';
     card.find('span, p').each((_: number, el: any) => {
-      if (venue) return false;
+      if (venue || $(el).children().length > 0) return;
       const txt = $(el).text().trim();
-      if (txt && txt.length > 3 && txt.length < 50 &&
+      if (txt &&
+          txt.length > 3 && txt.length < 40 &&
+          !txt.includes(' vs ') &&
           !/[0-9]/.test(txt) &&
-          !/log.?in|sign|menu|advert|live|upcoming|schedule/i.test(txt)) {
+          !/log.?in|sign|menu|live|won|tied|drawn|upcoming|match|t20|odi|test/i.test(txt)) {
         venue = txt;
         return false;
       }
@@ -111,12 +134,12 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 
     matches.push({
       id: matchId,
-      team1: team1 || 'TBD',
-      team2: team2 || 'TBD',
+      team1: team1 || slug.split('-')[0].toUpperCase(),
+      team2: team2 || (slug.split('-')[2] || '').toUpperCase(),
       teams: [team1, team2].filter(Boolean),
-      status,
+      status: isLive ? 'live' : 'upcoming',
       venue,
-      score,
+      score: scores,
       matchType: 'T20',
     });
   });
@@ -150,21 +173,25 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
     if (!matchId || seenIds.has(matchId)) return;
     seenIds.add(matchId);
 
-    // Teams from URL slug
+    // Teams from URL slug — extract short codes only
     const slug = parts[3] || '';
     const vsIdx = slug.indexOf('-vs-');
     let team1 = '', team2 = '';
     if (vsIdx > -1) {
-      team1 = slug.substring(0, vsIdx).replace(/-/g, ' ').replace(/\w/g, (c: string) => c.toUpperCase());
-      team2 = slug.substring(vsIdx + 4).split('-').slice(0, 3).join(' ').replace(/\w/g, (c: string) => c.toUpperCase());
+      const rawT1 = slug.substring(0, vsIdx).replace(/-[0-9].*$/, '').replace(/-(?:tour|series|of|the).*$/i, '');
+      const rawT2 = slug.substring(vsIdx + 4).replace(/-[0-9].*$/, '').replace(/-(?:tour|series|of|the).*$/i, '');
+      team1 = rawT1.toUpperCase().replace(/-/g, ' ');
+      team2 = rawT2.toUpperCase().replace(/-/g, ' ');
     }
-    const teams = team1 && team2 ? `${team1} vs ${team2}` : slug;
+    const teams = team1 && team2 ? `${team1} vs ${team2}` : (team1 || slug.substring(0, 20));
 
-    // Walk up to card
+    // Walk up to card — stop when we have a container with ONLY this match link
     let card = $(el);
-    for (let d = 0; d < 6; d++) {
-      card = card.parent();
-      if (card.text().trim().length > 20) break;
+    for (let d = 0; d < 8; d++) {
+      const parent = card.parent();
+      const linksInParent = parent.find("a[href*='/live-cricket-scores/']").length;
+      if (linksInParent > 1) break; // stop before container with multiple matches
+      card = parent;
     }
 
     const cardText = card.text().replace(/\s+/g, ' ').trim();
@@ -185,6 +212,8 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
           txt.length > 3 &&
           txt.length < 40 &&
           !/[0-9\/]/.test(txt) &&
+          !txt.includes(' vs ') &&
+          !txt.includes(' VS ') &&
           !/log.?in|sign|menu|name:|live|qualifier|upcoming|schedule|won|tied|drawn/i.test(txt) &&
           !/^(T20|ODI|Test|Women|Men|Match|Series|vs|and|the|of|in)$/i.test(txt)) {
         venue = txt;
@@ -303,17 +332,50 @@ app.get(
   })
 );
 
+// ── Cache for live matches — prevents Puppeteer timeout ──
+let liveMatchCache: any[] = [];
+let liveCacheTime = 0;
+const LIVE_CACHE_TTL = 60 * 1000; // 60 seconds
+
+// Background refresh — runs every 60s, doesn't block requests
+async function refreshLiveCache() {
+  try {
+    const matches = await fetchLiveMatches();
+    liveMatchCache = matches;
+    liveCacheTime = Date.now();
+    console.log(`[cache] Live matches updated: ${matches.length}`);
+  } catch (err) {
+    console.error('[cache] Live refresh failed:', err);
+  }
+}
+
+// Start background refresh immediately and every 60s
+refreshLiveCache();
+setInterval(refreshLiveCache, LIVE_CACHE_TTL);
+
 // ── Existing /live endpoint ───────────────────────────────
 app.get(
   "/live",
   asyncHandler(async (req: Request, res: Response) => {
-    try {
-      const liveMatches = await fetchLiveMatches();
-      res.json(liveMatches);
-    } catch (err) {
-      console.error("Error fetching live matches:", err);
-      res.status(500).json({ error: "Failed to fetch live matches" });
-    }
+    // Always return cached data instantly — no Puppeteer wait
+    const age = Math.round((Date.now() - liveCacheTime) / 1000);
+    res.json({
+      matches: liveMatchCache,
+      cached: true,
+      ageSeconds: age,
+      count: liveMatchCache.length,
+    });
+  })
+);
+
+// ── GET /live/cricket — filtered cricket only ────────────
+app.get(
+  "/live/cricket",
+  asyncHandler(async (req: Request, res: Response) => {
+    const cricket = liveMatchCache.filter((m: any) =>
+      m.matchType === 'T20' || m.matchType === 'ODI' || m.matchType === 'Test'
+    );
+    res.json({ matches: cricket, count: cricket.length });
   })
 );
 
