@@ -339,6 +339,23 @@ app.get(
   })
 );
 
+// Debug endpoint to view raw HTML
+app.get(
+  "/debug/series/:seriesId/html",
+  asyncHandler(async (req: Request, res: Response) => {
+    const seriesId = req.params.seriesId;
+    const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
+    try {
+      const html = await fetchHTMLWithBrowser(url);
+      res.setHeader('Content-Type', 'text/html');
+      res.send(html);
+    } catch (err) {
+      console.error("[debug] Error fetching HTML:", err);
+      res.status(500).send("Error fetching HTML: " + (err as Error).message);
+    }
+  })
+);
+
 // 404 handler
 app.use((req: Request, res: Response) => {
   res.status(404).json({ error: 'Resource not found' });
