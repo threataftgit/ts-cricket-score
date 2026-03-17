@@ -83,122 +83,70 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
   console.log(`[series] Fetching URL: ${url}`);
-
-  let html;
-  try {
-    html = await fetchHTML(url);
-    console.log(`[series] HTML fetched, length: ${html.length}`);
-  } catch (err) {
-    console.error(`[series] Error fetching HTML:`, err);
-    return [];
-  }
-
+  const html = await fetchHTML(url);
   const $ = cheerio.load(html);
   const matches: any[] = [];
 
-  // Try multiple possible selectors for match cards
-  const selectors = [
-    "a[href*='/live-cricket-scores/'].w-full.bg-cbWhite.flex.flex-col.p-3.gap-1",
-    "a[href*='/live-cricket-scores/']", // more generic
-    ".cb-mtch-lst.cb-col.cb-col-100",
-    "div.border-b.p-4",
-    "div[id*='matchCard']"
-  ];
+  // Each match card is an <a> tag with these specific classes
+  $("a[href*='/live-cricket-scores/'].w-full.bg-cbWhite.flex.flex-col.p-3.gap-1").each((i, el) => {
+    const link = $(el).attr("href");
+    const matchId = link ? link.split("/")[2] : null;
+    if (!matchId) return;
 
-  let matchElements = null;
-  let usedSelector = '';
-  for (const sel of selectors) {
-    matchElements = $(sel);
-    console.log(`[series] Selector "${sel}" found ${matchElements.length} elements`);
-    if (matchElements.length > 0) {
-      usedSelector = sel;
-      break;
-    }
-  }
-
-  if (!matchElements || matchElements.length === 0) {
-    console.log("[series] No match cards found with any selector");
-    return [];
-  }
-
-  console.log(`[series] Using selector: ${usedSelector}`);
-
-  matchElements.each((i, el) => {
-    const link = $(el).is('a') ? $(el).attr('href') : $(el).find('a[href*="/live-cricket-scores/"]').attr('href');
-    const matchId = link ? link.split('/')[2] : null;
-    if (!matchId) {
-      console.log(`[series] Skipping element ${i}: no matchId found`);
-      return;
-    }
-
-    // Extract team names – try several possible locations
-    let teams = '';
-    const teamSelectors = [
-      'span.hidden.wb\\:block.truncate.max-w-\\[100\\%\\]',
-      'span.text-cbTxtSec.hidden.wb\\:block',
-      '.cb-match-teams',
-      'p.font-bold'
-    ];
-    for (const ts of teamSelectors) {
-      const teamSpans = $(el).find(ts);
-      if (teamSpans.length >= 2) {
-        teams = teamSpans.map((j, span) => $(span).text().trim()).get().join(' vs ');
-        break;
+    // --- Extract teams ---
+    let team1 = '', team2 = '';
+    // Full team names are in spans with class "hidden wb:block truncate max-w-[100%]"
+    const teamSpans = $(el).find("span.hidden.wb\\:block.truncate.max-w-\\[100\\%\\]");
+    if (teamSpans.length >= 2) {
+      team1 = $(teamSpans[0]).text().trim();
+      team2 = $(teamSpans[1]).text().trim();
+    } else {
+      // Fallback to short names (NZ, RSA) if full names not found
+      const shortSpans = $(el).find("span.block.wb\\:hidden.truncate.max-w-\\[100\\%\\]");
+      if (shortSpans.length >= 2) {
+        team1 = $(shortSpans[0]).text().trim();
+        team2 = $(shortSpans[1]).text().trim();
       }
     }
-    if (!teams) {
-      // fallback: take any text that looks like team names
-      const text = $(el).text();
-      const possibleTeams = text.match(/[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g)?.slice(0,2) || [];
-      teams = possibleTeams.join(' vs ');
-    }
-    console.log(`[series] Teams extracted: "${teams}"`);
+    const teams = team1 && team2 ? `${team1} vs ${team2}` : '';
 
-    // Extract result
-    let result = '';
-    const resultSelectors = [
-      'div.text-cbComplete',
-      '.cb-match-status',
-      'p.text-\\[#a36501\\]',
-      'div.cb-text-complete'
-    ];
-    for (const rs of resultSelectors) {
-      result = $(el).find(rs).first().text().trim();
-      if (result) break;
-    }
-    console.log(`[series] Result: "${result}"`);
+    // --- Extract scores ---
+    const scores: string[] = [];
+    $(el).find("span.font-medium.wb\\:font-semibold").each((j, span) => {
+      scores.push($(span).text().trim());
+    });
 
-    // Extract venue
+    // --- Extract result ---
+    const result = $(el).find("div.text-cbComplete").text().trim();
+
+    // --- Extract venue ---
     let venue = '';
-    const venueSelectors = [
-      'span.text-xs.text-cbTxtSec',
-      '.cb-venue',
-      'span.text-gray-500'
-    ];
-    for (const vs of venueSelectors) {
-      const v = $(el).find(vs).first().text().trim();
-      if (v) {
-        // Clean up: remove match number and leading/trailing spaces
-        venue = v.split('•').pop()?.trim() || v;
-        break;
-      }
+    const infoSpan = $(el).find("span.text-xs.text-cbTxtSec").first();
+    if (infoSpan.length) {
+      const infoText = infoSpan.text().trim();
+      const parts = infoText.split("•").map(s => s.trim());
+      venue = parts.length > 1 ? parts[1] : '';
     }
-    console.log(`[series] Venue: "${venue}"`);
 
-    // Date – try to find a nearby date element
+    // --- Extract date (if available) ---
     let date = '';
-    const dateSelectors = [
-      'span.text-xs.text-cbTxtSec.ml-1',
-      '.cb-match-date',
-      'span.text-cbTxtSec.text-xs'
-    ];
-    for (const ds of dateSelectors) {
-      date = $(el).find(ds).first().text().trim();
-      if (date) break;
+    const dateSpan = $(el).find("span.text-cbTxtSec.text-xs").last();
+    if (dateSpan.length) {
+      date = dateSpan.text().trim();
     }
-    console.log(`[series] Date: "${date}"`);
 
-    matches.push({ matchId, teams, result, venue, date });
+    // Only include matches that look like NZ vs RSA men's T20Is
+    if (matchId && teams && (teams.includes('New Zealand') || teams.includes('South Africa'))) {
+      matches.push({
+        matchId,
+        teams,
+        score: scores, // e.g., ["91 (14.3)", "93-3 (16.4)"]
+        result,
+        venue,
+        date
+      });
+      console.log(`[series] Added match: ${teams} - ${result} at ${venue}`);
+    }
   });
 
   console.log(`[series] Total matches extracted: ${matches.length}`);
