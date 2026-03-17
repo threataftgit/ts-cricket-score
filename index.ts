@@ -189,7 +189,7 @@ const seriesCache: Record<string, {data: any[], ts: number}> = {};
 const SERIES_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
 // Track in-progress fetches to prevent duplicate parallel requests
-const seriesInProgress: Record<string, Promise<any[]>> = {};
+const seriesInProgress: Record<string, Promise<any[]> | null> = {};
 
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   // Return cache if fresh
@@ -200,9 +200,9 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   }
 
   // If already fetching this series, return the same promise
-  if (seriesInProgress[seriesId]) {
+  if (seriesInProgress[seriesId] != null) {
     console.log(`[series] Already fetching ${seriesId} — waiting for existing request`);
-    return seriesInProgress[seriesId];
+    return seriesInProgress[seriesId] as Promise<any[]>;
   }
 
   const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
@@ -328,7 +328,7 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   console.log(`[series] Total: ${matches.length}`);
   // Save to cache
   seriesCache[seriesId] = { data: matches, ts: Date.now() };
-  delete seriesInProgress[seriesId];
+  seriesInProgress[seriesId] = null;
   return matches;
   })(); // end fetchPromise
 
