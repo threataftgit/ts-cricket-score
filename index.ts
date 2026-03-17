@@ -115,32 +115,29 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   const $ = cheerio.load(html);
   const matches: any[] = [];
 
-  // Find all links to match scorecards
   $("a[href*='/live-cricket-scores/']").each((i, el) => {
     const link = $(el).attr('href');
     const matchId = link ? link.split('/')[2] : null;
     if (!matchId) return;
 
-    // Locate the card container
     const cardDiv = $(el).find('div.border-b.p-4');
     if (cardDiv.length === 0) return;
 
-    // Extract team short names (e.g., "NZ", "RSA")
+    // Team short names
     const teamDivs = cardDiv.find('div.font-semibold');
     const team1 = teamDivs.first().text().trim();
     const team2 = teamDivs.last().text().trim();
     const teams = team1 && team2 ? `${team1} vs ${team2}` : '';
 
-    // Extract scores (optional, can be used later)
+    // Scores (optional)
     const scoreDivs = cardDiv.find('div.text-gray-700.text-sm');
     const score1 = scoreDivs.first().text().trim();
     const score2 = scoreDivs.last().text().trim();
 
-    // Extract result/status from the paragraph with class text-[#a36501]
-    const resultEl = cardDiv.find('p.text-\\[#a36501\\]');
-    const result = resultEl.text().trim();
+    // Result/status is always the last paragraph in the card
+    const result = cardDiv.find('p').last().text().trim();
 
-    // Extract venue
+    // Venue
     const venueEl = cardDiv.find('span.text-gray-500.text-xs.ml-1');
     const venue = venueEl.text().trim();
 
@@ -154,8 +151,6 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   console.log(`[series] Total matches extracted: ${matches.length}`);
   return matches;
 };
-
-
 
 
 
