@@ -188,6 +188,9 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 const seriesCache: Record<string, {data: any[], ts: number}> = {};
 const SERIES_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
+// Track in-progress fetches to prevent duplicate parallel requests
+const seriesInProgress: Record<string, Promise<any[]>> = {};
+
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   // Return cache if fresh
   const cached = seriesCache[seriesId];
@@ -196,8 +199,17 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
     return cached.data;
   }
 
+  // If already fetching this series, return the same promise
+  if (seriesInProgress[seriesId]) {
+    console.log(`[series] Already fetching ${seriesId} — waiting for existing request`);
+    return seriesInProgress[seriesId];
+  }
+
   const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
   console.log(`[series] Fetching: ${url}`);
+
+  // Create and track the promise
+  const fetchPromise = (async () => {
 
   let html: string;
   try {
@@ -261,26 +273,52 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
       );
       const s$ = cheerio.load(scoreHtml);
 
-      // Result selectors — try multiple
+      // Try old Cricbuzz class selectors first
       result = s$('.cb-text-complete').first().text().trim()
         || s$('.cb-min-stts').first().text().trim()
-        || s$('[class*="complete"]').first().text().trim()
+        || s$('.cb-text-inprogress').first().text().trim()
         || '';
 
-      // Clean — extract just the result sentence
-      const rm = result.match(/([A-Za-z][a-zA-Z ]+ (?:won by [0-9]+ (?:runs?|wickets?|wkts?)|tied|drawn|no result|abandoned))/i);
-      if (rm) result = rm[1].trim();
+      // New Tailwind UI — scan all text for result keywords
+      if (!result) {
+        s$('*').each((_i: number, el: any) => {
+          if (result) return false;
+          if (s$(el).children().length > 2) return;
+          const txt = s$(el).text().trim();
+          if (txt && txt.length < 150 &&
+            /won by [0-9]+ (?:runs?|wickets?|wkts?)|tied|drawn|no result|abandoned/i.test(txt)) {
+            result = txt;
+            return false;
+          }
+        });
+      }
 
-      // Venue from match header or sub-header
+      // Clean result
+      if (result) {
+        const rm = result.match(/([A-Za-z][a-zA-Z ]+ (?:won by [0-9]+ (?:runs?|wickets?|wkts?)|tied|drawn|no result|abandoned))/i);
+        if (rm) result = rm[1].trim();
+      }
+
+      // Venue — try multiple selectors
       venue = s$('.cb-nav-subhdr span').last().text().trim()
         || s$('[itemprop="location"]').text().trim()
+        || s$('span[class*="venue"]').text().trim()
         || '';
 
-      // Clean venue — remove numbers/dates
-      venue = venue.replace(/[0-9,]+/g, '').replace(/\s+/g, ' ').trim();
+      // New UI venue — look in page title or header
+      if (!venue) {
+        const headerText = s$('h1, h2').first().text().trim();
+        const vm = headerText.match(/,\s*([A-Za-z ]{4,30})$/);
+        if (vm) venue = vm[1].trim();
+      }
 
-    } catch (e) {
-      console.error(`[series] Score page failed for ${matchId}:`, e);
+      // Clean venue
+      venue = venue.replace(/[0-9]+/g, '').replace(/\s+/g, ' ').trim();
+
+      console.log(`[series] ${matchId} result="${result}" venue="${venue}" html_len=${scoreHtml.length}`);
+
+    } catch (e: any) {
+      console.error(`[series] Score page failed for ${matchId}: ${e.message}`);
     }
 
     console.log(`[series] ID=${matchId} teams="${teams}" result="${result}" venue="${venue}"`);
@@ -290,7 +328,12 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   console.log(`[series] Total: ${matches.length}`);
   // Save to cache
   seriesCache[seriesId] = { data: matches, ts: Date.now() };
+  delete seriesInProgress[seriesId];
   return matches;
+  })(); // end fetchPromise
+
+  seriesInProgress[seriesId] = fetchPromise;
+  return fetchPromise;
 };
 
 
