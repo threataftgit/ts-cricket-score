@@ -183,7 +183,7 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
       const txt = $(resEl).text().trim();
       if (txt && /won by|tied|no result|drawn|abandoned/i.test(txt)) {
         // Extract ONLY the result sentence using regex
-        const match = txt.match(/((?:\w[\w\s]*?)\s+(?:won by[\w\s,]+|tied|no result|drawn|abandoned[^.]*?)(?:\.|$))/i);
+        const match = txt.match(/((?:[A-Za-z][\w\s]*?)\s+(?:won by[\w\s,]+|tied|no result|drawn|abandoned[^.]*?)(?:[.]|$))/i);
         if (match) {
           result = match[1].trim();
         } else {
@@ -192,11 +192,12 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
           if (wonIdx > -1) {
             // Walk back to find team name before "won by"
             const before = txt.substring(0, wonIdx);
-            const teamMatch = before.match(/([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s*$/);
+            const teamMatch = before.match(/([A-Z][a-z]+( [A-Z][a-z]+)*) *$/);
             const teamPart = teamMatch ? teamMatch[1] + ' ' : '';
-            const after = txt.substring(wonIdx).split(/
-|[A-Z]{2,3}\d/)[0].trim();
-            result = (teamPart + after).trim();
+            const afterText = txt.substring(wonIdx);
+            const newlineIdx = afterText.indexOf(' ');
+            const cleanAfter = afterText.split(' ').slice(0, 8).join(' ');
+            result = (teamPart + cleanAfter).trim();
           }
         }
         return false;
