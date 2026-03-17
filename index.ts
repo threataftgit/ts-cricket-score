@@ -35,21 +35,55 @@ const fetchHTML = async (url: string): Promise<string> => {
   }
 };
 
-// Puppeteer-based fetch for Cloudflare‑protected pages
+// Shared browser instance — reused across all requests
+let sharedBrowser: any = null;
+
+async function getSharedBrowser() {
+  if (!sharedBrowser) {
+    sharedBrowser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+      ],
+    });
+    console.log('[browser] Shared browser started');
+    // Restart browser if it crashes
+    sharedBrowser.on('disconnected', () => {
+      console.log('[browser] Browser disconnected — will restart on next request');
+      sharedBrowser = null;
+    });
+  }
+  return sharedBrowser;
+}
+
+// Puppeteer-based fetch — reuses shared browser, opens/closes only the page
 const fetchHTMLWithBrowser = async (url: string): Promise<string> => {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'], // required for Railway
-  });
+  const browser = await getSharedBrowser();
+  const page = await browser.newPage();
   try {
-    const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-    await page.waitForSelector('.cb-col', { timeout: 10000 }).catch(() => {});
+    await page.setRequestInterception(true);
+    // Block images, fonts, media — speeds up page load significantly
+    page.on('request', (req: any) => {
+      const rt = req.resourceType();
+      if (['image', 'media', 'font', 'stylesheet'].includes(rt)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await new Promise(r => setTimeout(r, 1500)); // wait for JS render
     const html = await page.content();
     return html;
   } finally {
-    await browser.close();
+    await page.close(); // close page only, keep browser alive
   }
 };
 
@@ -150,7 +184,18 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 
 // ── Fetch series matches (uses Puppeteer) ─────────────────
 
+// Cache for series results — completed matches don't change
+const seriesCache: Record<string, {data: any[], ts: number}> = {};
+const SERIES_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
+  // Return cache if fresh
+  const cached = seriesCache[seriesId];
+  if (cached && Date.now() - cached.ts < SERIES_CACHE_TTL) {
+    console.log(`[series] Returning cached data for ${seriesId} (${cached.data.length} matches)`);
+    return cached.data;
+  }
+
   const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
   console.log(`[series] Fetching: ${url}`);
 
@@ -243,6 +288,8 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   }
 
   console.log(`[series] Total: ${matches.length}`);
+  // Save to cache
+  seriesCache[seriesId] = { data: matches, ts: Date.now() };
   return matches;
 };
 
