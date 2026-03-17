@@ -2,6 +2,7 @@ import express, { Application, Request, Response, NextFunction } from "express";
 import axios from "axios";
 import * as cheerio from "cheerio";
 import path from 'path';
+import puppeteer from 'puppeteer';
 import errorHandler from './utils/error';
 import { setSecureHeaders } from "./utils/secureHeaders";
 
@@ -22,6 +23,7 @@ app.get('/', (req: Request, res: Response) => {
   res.sendFile(path.join(__dirname, '.', 'public', 'index.html'));
 });
 
+// Simple axios fetch for endpoints that don't trigger Cloudflare
 const fetchHTML = async (url: string): Promise<string> => {
   try {
     const response = await axios.get(url, {
@@ -33,7 +35,26 @@ const fetchHTML = async (url: string): Promise<string> => {
   }
 };
 
-// ── Fetch live matches (existing) ─────────────────────────
+// Puppeteer-based fetch for Cloudflare‑protected pages
+const fetchHTMLWithBrowser = async (url: string): Promise<string> => {
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'], // required for Railway
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    // Wait for actual content to appear (not the Cloudflare challenge)
+    await page.waitForSelector('.cb-col', { timeout: 10000 }).catch(() => {});
+    const html = await page.content();
+    return html;
+  } finally {
+    await browser.close();
+  }
+};
+
+// ── Fetch live matches (still uses axios, seems fine) ─────
 const fetchLiveMatches = async (): Promise<any[]> => {
   const url = "https://www.cricbuzz.com/cricket-match/live-scores";
   const html = await fetchHTML(url);
@@ -77,14 +98,14 @@ const fetchLiveMatches = async (): Promise<any[]> => {
   return matches;
 };
 
-// ── Fetch series matches (completed/upcoming) ─────────────
+// ── Fetch series matches (uses Puppeteer) ─────────────────
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
   console.log(`[series] Fetching URL: ${url}`);
 
   let html: string;
   try {
-    html = await fetchHTML(url);
+    html = await fetchHTMLWithBrowser(url);
     console.log(`[series] HTML fetched, length: ${html.length}`);
   } catch (err) {
     console.error(`[series] Error fetching HTML:`, err);
@@ -97,7 +118,7 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   // Try multiple possible selectors for match cards
   const cardSelectors = [
     "a[href*='/live-cricket-scores/'].w-full.bg-cbWhite.flex.flex-col.p-3.gap-1",
-    "a[href*='/live-cricket-scores/']", // more generic
+    "a[href*='/live-cricket-scores/']",
     "div.border-b.p-4",
     ".cb-mtch-lst.cb-col.cb-col-100"
   ];
@@ -120,68 +141,41 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   console.log(`[series] Using card selector: ${usedCardSelector}`);
 
   cardElements.each((i, el) => {
-    // Find the link to get matchId
     const linkEl = $(el).is('a') ? $(el) : $(el).find('a[href*="/live-cricket-scores/"]').first();
     const link = linkEl.attr('href');
     const matchId = link ? link.split('/')[2] : null;
-    if (!matchId) {
-      console.log(`[series] Skipping element ${i}: no matchId found`);
-      return;
-    }
+    if (!matchId) return;
 
-    // --- Extract teams ---
+    // Extract teams
     let teams = '';
-    // Try full team names first
     const fullTeamSpans = $(el).find("span.hidden.wb\\:block.truncate.max-w-\\[100\\%\\]");
     if (fullTeamSpans.length >= 2) {
       const team1 = $(fullTeamSpans[0]).text().trim();
       const team2 = $(fullTeamSpans[1]).text().trim();
       teams = `${team1} vs ${team2}`;
     } else {
-      // Fallback to short names
       const shortTeamSpans = $(el).find("span.block.wb\\:hidden.truncate.max-w-\\[100\\%\\]");
       if (shortTeamSpans.length >= 2) {
         const team1 = $(shortTeamSpans[0]).text().trim();
         const team2 = $(shortTeamSpans[1]).text().trim();
         teams = `${team1} vs ${team2}`;
-      } else {
-        // Last resort: take any two spans that look like team names
-        const allSpans = $(el).find("span");
-        const possibleTeams: string[] = [];
-        allSpans.each((j, span) => {
-          const text = $(span).text().trim();
-          if (text && text.length < 30 && !text.includes('•') && !text.includes(':')) {
-            possibleTeams.push(text);
-          }
-        });
-        if (possibleTeams.length >= 2) {
-          teams = `${possibleTeams[0]} vs ${possibleTeams[1]}`;
-        }
       }
     }
-    console.log(`[series] Match ${i} teams: "${teams}"`);
 
-    // --- Extract scores ---
+    // Extract scores
     const scores: string[] = [];
     $(el).find("span.font-medium.wb\\:font-semibold").each((j, span) => {
       scores.push($(span).text().trim());
     });
-    console.log(`[series] Match ${i} scores:`, scores);
 
-    // --- Extract result ---
+    // Extract result
     let result = '';
     const resultEl = $(el).find("div.text-cbComplete").first();
     if (resultEl.length) {
       result = resultEl.text().trim();
-    } else {
-      // Fallback: look for any text containing "won"
-      const allText = $(el).text();
-      const wonMatch = allText.match(/(New Zealand|South Africa)\s+won\s+by\s+[\d\s]+(runs|wkts)/i);
-      if (wonMatch) result = wonMatch[0];
     }
-    console.log(`[series] Match ${i} result: "${result}"`);
 
-    // --- Extract venue ---
+    // Extract venue
     let venue = '';
     const infoSpan = $(el).find("span.text-xs.text-cbTxtSec").first();
     if (infoSpan.length) {
@@ -189,29 +183,18 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
       const parts = infoText.split("•").map(s => s.trim());
       venue = parts.length > 1 ? parts[1] : '';
     }
-    console.log(`[series] Match ${i} venue: "${venue}"`);
 
-    // --- Extract date ---
+    // Extract date
     let date = '';
     const dateSpan = $(el).find("span.text-cbTxtSec.text-xs").last();
     if (dateSpan.length) {
       date = dateSpan.text().trim();
     }
-    console.log(`[series] Match ${i} date: "${date}"`);
 
-    // Only include matches that look like NZ vs RSA (optional, remove if you want all)
+    // Filter for NZ vs RSA
     if (matchId && teams && (teams.includes('New Zealand') || teams.includes('South Africa'))) {
-      matches.push({
-        matchId,
-        teams,
-        score: scores,
-        result,
-        venue,
-        date
-      });
+      matches.push({ matchId, teams, score: scores, result, venue, date });
       console.log(`[series] Added match: ${teams}`);
-    } else {
-      console.log(`[series] Skipped match (not NZ vs RSA): ${teams}`);
     }
   });
 
@@ -219,10 +202,10 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   return matches;
 };
 
-// ── Fetch full scorecard for a match ─────────────────
+// ── Fetch full scorecard (also uses Puppeteer) ────────────
 const fetchScorecard = async (matchId: string): Promise<any> => {
   const url = `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}/nz-vs-sa`;
-  const html = await fetchHTML(url);
+  const html = await fetchHTMLWithBrowser(url);
   const $ = cheerio.load(html);
 
   const matchName = $("h1.cb-nav-hdr").text().trim();
@@ -304,7 +287,6 @@ app.get(
       res.status(400).json({ error: "Match ID is required" });
       return;
     }
-
     const url = `https://www.cricbuzz.com/live-cricket-scores/${id}`;
     const html = await fetchHTML(url);
     const $ = cheerio.load(html);
@@ -353,21 +335,6 @@ app.get(
     } catch (err) {
       console.error("Error fetching scorecard:", err);
       res.status(500).json({ error: "Failed to fetch scorecard" });
-    }
-  })
-);
-
-app.get(
-  "/debug/series/:seriesId/html",
-  asyncHandler(async (req: Request, res: Response) => {
-    const seriesId = req.params.seriesId;
-    const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
-    try {
-      const html = await fetchHTML(url);
-      res.setHeader('Content-Type', 'text/html');
-      res.send(html);
-    } catch (err) {
-      res.status(500).send("Error fetching HTML");
     }
   })
 );
