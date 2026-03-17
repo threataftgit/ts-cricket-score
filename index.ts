@@ -166,70 +166,73 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   const matches: any[] = [];
   const seenIds = new Set<string>();
 
+  // Step 1: collect all match IDs and basic info from links
+  const matchLinks: Array<{matchId: string, slug: string}> = [];
   $("a[href*='/live-cricket-scores/']").each((i, el) => {
     const link = $(el).attr('href') || '';
     const parts = link.split('/');
     const matchId = parts[2];
+    const slug = parts[3] || '';
     if (!matchId || seenIds.has(matchId)) return;
     seenIds.add(matchId);
+    matchLinks.push({ matchId, slug });
+  });
 
-    // Teams from URL slug — extract short codes only
-    const slug = parts[3] || '';
+  console.log(`[series] Found ${matchLinks.length} match links`);
+
+  // Step 2: for each match, use the /score endpoint to get result
+  // Process sequentially to avoid hammering Cricbuzz
+  for (const { matchId, slug } of matchLinks) {
+    // Extract teams from slug
     const vsIdx = slug.indexOf('-vs-');
-    let team1 = '', team2 = '';
+    let teams = '';
     if (vsIdx > -1) {
-      const rawT1 = slug.substring(0, vsIdx).replace(/-[0-9].*$/, '').replace(/-(?:tour|series|of|the).*$/i, '');
-      const rawT2 = slug.substring(vsIdx + 4).replace(/-[0-9].*$/, '').replace(/-(?:tour|series|of|the).*$/i, '');
-      team1 = rawT1.toUpperCase().replace(/-/g, ' ');
-      team2 = rawT2.toUpperCase().replace(/-/g, ' ');
-    }
-    const teams = team1 && team2 ? `${team1} vs ${team2}` : (team1 || slug.substring(0, 20));
-
-    // Walk up to card — stop when we have a container with ONLY this match link
-    let card = $(el);
-    for (let d = 0; d < 8; d++) {
-      const parent = card.parent();
-      const linksInParent = parent.find("a[href*='/live-cricket-scores/']").length;
-      if (linksInParent > 1) break; // stop before container with multiple matches
-      card = parent;
+      const rawT1 = slug.substring(0, vsIdx)
+        .replace(/-[0-9].*$/, '')
+        .replace(/-(?:tour|series|of|the|and).*$/i, '');
+      const rawT2 = slug.substring(vsIdx + 4)
+        .replace(/-[0-9].*$/, '')
+        .replace(/-(?:tour|series|of|the|and).*$/i, '');
+      teams = `${rawT1.toUpperCase()} vs ${rawT2.toUpperCase()}`;
+    } else {
+      // No vs in slug — use match number descriptor
+      teams = slug.split('-').slice(0, 4).join(' ').toUpperCase();
     }
 
-    const cardText = card.text().replace(/\s+/g, ' ').trim();
-
-    // Extract result
+    // Get result from the score page (fast axios, no Puppeteer)
     let result = '';
-    const resultRe = /([A-Za-z][a-zA-Z ]+ (?:won by [0-9]+ (?:runs?|wickets?|wkts?)|tied|drawn|no result|abandoned))/i;
-    const rm = cardText.match(resultRe);
-    if (rm) result = rm[1].trim();
-
-    // Extract venue — find city/ground name
     let venue = '';
-    card.find('span, div, p').each((_: number, el: any) => {
-      if (venue) return false;
-      if ($(el).children().length > 0) return;
-      const txt = $(el).text().trim();
-      if (txt &&
-          txt.length > 3 &&
-          txt.length < 40 &&
-          !/[0-9\/]/.test(txt) &&
-          !txt.includes(' vs ') &&
-          !txt.includes(' VS ') &&
-          !/log.?in|sign|menu|name:|live|qualifier|upcoming|schedule|won|tied|drawn/i.test(txt) &&
-          !/^(T20|ODI|Test|Women|Men|Match|Series|vs|and|the|of|in)$/i.test(txt)) {
-        venue = txt;
-        return false;
-      }
-    });
+    try {
+      const scoreUrl = `https://www.cricbuzz.com/live-cricket-scores/${matchId}/${slug}`;
+      const scoreHtml = await fetchHTML(scoreUrl);
+      const s$ = cheerio.load(scoreHtml);
 
-    // Extract date
-    let date = '';
-    const dateRe = /([0-9]{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* [0-9]{4})/i;
-    const dm = cardText.match(dateRe);
-    if (dm) date = dm[1];
+      // Result is in cb-min-stts or cb-text-complete
+      result = s$('.cb-text-complete, .cb-min-stts').first().text().trim();
+
+      // Clean result — extract just the result line
+      const resultMatch = result.match(/([A-Za-z ]+(?:won by [0-9]+ (?:runs?|wickets?|wkts?)|tied|drawn|no result|abandoned))/i);
+      if (resultMatch) result = resultMatch[1].trim();
+
+      // Venue
+      venue = s$('.cb-nav-subhdr .cb-font-12').last().text().trim()
+        || s$('[itemprop="location"]').text().trim()
+        || '';
+
+      // Also try from the match header
+      if (!venue) {
+        const headerText = s$('h2.cb-nav-hdr').text();
+        const venueMatch = headerText.match(/,\s*([A-Za-z ]+)$/);
+        if (venueMatch) venue = venueMatch[1].trim();
+      }
+
+    } catch (e) {
+      // Score page fetch failed — leave result empty
+    }
 
     console.log(`[series] ID=${matchId} teams="${teams}" result="${result}" venue="${venue}"`);
-    matches.push({ matchId, teams, score1: '', score2: '', result, venue, date });
-  });
+    matches.push({ matchId, teams, score1: '', score2: '', result, venue, date: '' });
+  }
 
   console.log(`[series] Total: ${matches.length}`);
   return matches;
