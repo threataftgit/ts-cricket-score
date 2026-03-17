@@ -33,58 +33,7 @@ const fetchHTML = async (url: string): Promise<string> => {
   }
 };
 
-// NEW: Fetch live matches list from Cricbuzz
-const fetchLiveMatches = async (): Promise<any[]> => {
-  const url = "https://www.cricbuzz.com/cricket-match/live-scores";
-  const html = await fetchHTML(url);
-  const $ = cheerio.load(html);
-
-  const matches: any[] = [];
-
-  // Each live match is typically inside a <div> with class "cb-mtch-lst cb-col cb-col-100"
-  $(".cb-mtch-lst.cb-col.cb-col-100").each((index, element) => {
-    const matchElement = $(element);
-
-    // Extract match ID from the link
-    const link = matchElement.find("a.cb-lv-scrs-well").attr("href");
-    const id = link ? link.split("/")[2] : null; // e.g., "/live-cricket-scores/12345" → "12345"
-
-    // Team names
-    const teams: string[] = [];
-    matchElement.find(".cb-ovr-flo .cb-hmscg-tm-nm").each((i, el) => {
-      teams.push($(el).text().trim());
-    });
-
-    // Status (e.g., "Live", "Stumps", etc.)
-    const status = matchElement.find(".cb-text-live, .cb-text-complete, .cb-text-rain, .cb-text-abandon")
-      .first().text().trim() || "Upcoming";
-
-    // Venue (optional)
-    const venue = matchElement.find(".cb-venue").text().trim();
-
-    // Score lines – often multiple innings
-    const scores: string[] = [];
-    matchElement.find(".cb-ovr-flo .cb-scrs-wrp").each((i, el) => {
-      scores.push($(el).text().trim());
-    });
-
-    // Build match object
-    if (id && teams.length >= 2) {
-      matches.push({
-        id,
-        team1: teams[0],
-        team2: teams[1],
-        status,
-        venue,
-        score: scores, // e.g., ["289/10", "45/0"]
-        matchType: "T20", // You can try to detect from series name if needed
-      });
-    }
-  });
-
-  return matches;
-};
-
+// --- Existing parseCricketScore and fetchLiveMatches remain unchanged ---
 const parseCricketScore = ($: cheerio.CheerioAPI): Record<string, string> => {
     const getText = (selector: string): string =>
       $(selector).first().text().trim() || "Match Stats will Update Soon";
@@ -124,12 +73,113 @@ const parseCricketScore = ($: cheerio.CheerioAPI): Record<string, string> => {
     };
   };  
 
+const fetchLiveMatches = async (): Promise<any[]> => {
+  const url = "https://www.cricbuzz.com/cricket-match/live-scores";
+  const html = await fetchHTML(url);
+  const $ = cheerio.load(html);
+
+  const matches: any[] = [];
+
+  $(".cb-mtch-lst.cb-col.cb-col-100").each((index, element) => {
+    const matchElement = $(element);
+
+    const link = matchElement.find("a.cb-lv-scrs-well").attr("href");
+    const id = link ? link.split("/")[2] : null;
+
+    const teams: string[] = [];
+    matchElement.find(".cb-ovr-flo .cb-hmscg-tm-nm").each((i, el) => {
+      teams.push($(el).text().trim());
+    });
+
+    const status = matchElement.find(".cb-text-live, .cb-text-complete, .cb-text-rain, .cb-text-abandon")
+      .first().text().trim() || "Upcoming";
+
+    const venue = matchElement.find(".cb-venue").text().trim();
+
+    const scores: string[] = [];
+    matchElement.find(".cb-ovr-flo .cb-scrs-wrp").each((i, el) => {
+      scores.push($(el).text().trim());
+    });
+
+    if (id && teams.length >= 2) {
+      matches.push({
+        id,
+        team1: teams[0],
+        team2: teams[1],
+        status,
+        venue,
+        score: scores,
+        matchType: "T20",
+      });
+    }
+  });
+
+  return matches;
+};
+
+// --- NEW: Fetch series matches (completed/upcoming) ---
+const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
+  const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/new-zealand-vs-south-africa-2026`; // you can make series name dynamic
+  const html = await fetchHTML(url);
+  const $ = cheerio.load(html);
+  const matches: any[] = [];
+
+  // Selector for match cards on series page – adjust based on Cricbuzz structure
+  $(".cb-series-matches-list .cb-match-card").each((i, el) => {
+    const link = $(el).find("a.cb-match-cta").attr("href");
+    const matchId = link ? link.split("/")[2] : null;
+    const teams = $(el).find(".cb-match-teams").text().trim();
+    const result = $(el).find(".cb-match-status").text().trim();
+    const date = $(el).find(".cb-match-date").text().trim();
+    if (matchId) {
+      matches.push({ matchId, teams, result, date });
+    }
+  });
+
+  return matches;
+};
+
+// --- NEW: Fetch full scorecard for a match ---
+const fetchScorecard = async (matchId: string): Promise<any> => {
+  const url = `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}/nz-vs-sa`; // you can use generic title
+  const html = await fetchHTML(url);
+  const $ = cheerio.load(html);
+  
+  // Extract match info
+  const matchName = $("h1.cb-nav-hdr").text().trim();
+  const venue = $(".cb-col.cb-col-100.cb-venue-it").text().trim();
+  const result = $(".cb-col.cb-col-100.cb-font-12.cb-text-gray").first().text().trim();
+
+  // Parse innings
+  const innings: any[] = [];
+  $(".cb-col.cb-col-100.cb-ltst-wgt-hdr").each((i, innEl) => {
+    const innTitle = $(innEl).find(".cb-col.cb-col-100.cb-bg-gray").text().trim();
+    const batting: any[] = [];
+    $(innEl).find(".cb-col.cb-col-100.cb-scrd-itms").each((j, row) => {
+      const batsman = $(row).find(".cb-col.cb-col-27").text().trim();
+      const runs = $(row).find(".cb-col.cb-col-8.text-bold").text().trim();
+      const balls = $(row).find(".cb-col.cb-col-8").eq(1).text().trim();
+      const fours = $(row).find(".cb-col.cb-col-8").eq(2).text().trim();
+      const sixes = $(row).find(".cb-col.cb-col-8").eq(3).text().trim();
+      if (batsman && runs) {
+        batting.push({ batsman, runs, balls, fours, sixes });
+      }
+    });
+    // Similarly bowling, extras, fall of wickets can be added
+    innings.push({ title: innTitle, batting });
+  });
+
+  return { matchName, venue, result, innings };
+};
+
+// --- Async handler helper ---
 const asyncHandler =
   (fn: (req: Request, res: Response, next: NextFunction) => Promise<void>) =>
   (req: Request, res: Response, next: NextFunction): void => {
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 
+// --- Existing routes ---
 app.get(
   "/score",
   asyncHandler(async (req: Request, res: Response) => {
@@ -147,7 +197,6 @@ app.get(
   })
 );
 
-// NEW: Live matches endpoint
 app.get(
   "/live",
   asyncHandler(async (req: Request, res: Response) => {
@@ -161,6 +210,36 @@ app.get(
   })
 );
 
+// --- NEW routes ---
+app.get(
+  "/series/:seriesId/matches",
+  asyncHandler(async (req: Request, res: Response) => {
+    const seriesId = req.params.seriesId;
+    try {
+      const matches = await fetchSeriesMatches(seriesId);
+      res.json(matches);
+    } catch (err) {
+      console.error("Error fetching series matches:", err);
+      res.status(500).json({ error: "Failed to fetch series matches" });
+    }
+  })
+);
+
+app.get(
+  "/scorecard/:matchId",
+  asyncHandler(async (req: Request, res: Response) => {
+    const matchId = req.params.matchId;
+    try {
+      const scorecard = await fetchScorecard(matchId);
+      res.json(scorecard);
+    } catch (err) {
+      console.error("Error fetching scorecard:", err);
+      res.status(500).json({ error: "Failed to fetch scorecard" });
+    }
+  })
+);
+
+// 404 handler
 app.use((req: Request, res: Response) => {
   res.status(404).json({ error: 'Resource not found' });
 });
