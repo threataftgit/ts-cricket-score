@@ -282,7 +282,6 @@ app.get(
   })
 );
 
-// Debug endpoint to view raw HTML
 app.get(
   "/debug/series/:seriesId/html",
   asyncHandler(async (req: Request, res: Response) => {
@@ -293,8 +292,8 @@ app.get(
       res.setHeader('Content-Type', 'text/html');
       res.send(html);
     } catch (err) {
-      console.error("[debug] Error fetching HTML:", err);
-      res.status(500).send("Error fetching HTML: " + (err as Error).message);
+      console.error("[debug] Error:", err);
+      res.status(500).send("Error: " + err.message);
     }
   })
 );
