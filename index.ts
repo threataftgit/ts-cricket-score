@@ -99,102 +99,45 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 };
 
 // ── Fetch series matches (uses Puppeteer) ─────────────────
+
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
   console.log(`[series] Fetching URL: ${url}`);
-
-  let html: string;
-  try {
-    html = await fetchHTMLWithBrowser(url);
-    console.log(`[series] HTML fetched, length: ${html.length}`);
-  } catch (err) {
-    console.error(`[series] Error fetching HTML:`, err);
-    return [];
-  }
-
+  const html = await fetchHTMLWithBrowser(url);
   const $ = cheerio.load(html);
   const matches: any[] = [];
 
-  // Try multiple possible selectors for match cards
-  const cardSelectors = [
-    "a[href*='/live-cricket-scores/'].w-full.bg-cbWhite.flex.flex-col.p-3.gap-1",
-    "a[href*='/live-cricket-scores/']",
-    "div.border-b.p-4",
-    ".cb-mtch-lst.cb-col.cb-col-100"
-  ];
-
-  let cardElements = null;
-  let usedCardSelector = '';
-  for (const sel of cardSelectors) {
-    cardElements = $(sel);
-    console.log(`[series] Selector "${sel}" found ${cardElements.length} elements`);
-    if (cardElements.length > 0) {
-      usedCardSelector = sel;
-      break;
-    }
-  }
-
-  if (!cardElements || cardElements.length === 0) {
-    console.log("[series] No match cards found with any selector");
-    return [];
-  }
-  console.log(`[series] Using card selector: ${usedCardSelector}`);
-
-  cardElements.each((i, el) => {
-    const linkEl = $(el).is('a') ? $(el) : $(el).find('a[href*="/live-cricket-scores/"]').first();
-    const link = linkEl.attr('href');
+  // Find all links that look like match scorecards
+  $("a[href*='/live-cricket-scores/']").each((i, el) => {
+    const link = $(el).attr('href');
     const matchId = link ? link.split('/')[2] : null;
     if (!matchId) return;
 
-    // Extract teams
+    // Get all text inside the link to guess teams/result
+    const text = $(el).text().replace(/\s+/g, ' ').trim();
+    console.log(`[series] Candidate ${i}: ID=${matchId}, text="${text.substring(0,100)}..."`);
+
+    // Try to extract teams (simple heuristic)
     let teams = '';
-    const fullTeamSpans = $(el).find("span.hidden.wb\\:block.truncate.max-w-\\[100\\%\\]");
-    if (fullTeamSpans.length >= 2) {
-      const team1 = $(fullTeamSpans[0]).text().trim();
-      const team2 = $(fullTeamSpans[1]).text().trim();
-      teams = `${team1} vs ${team2}`;
-    } else {
-      const shortTeamSpans = $(el).find("span.block.wb\\:hidden.truncate.max-w-\\[100\\%\\]");
-      if (shortTeamSpans.length >= 2) {
-        const team1 = $(shortTeamSpans[0]).text().trim();
-        const team2 = $(shortTeamSpans[1]).text().trim();
-        teams = `${team1} vs ${team2}`;
-      }
-    }
+    const teamMatch = text.match(/(New Zealand|South Africa|NZ|RSA)\s+(?:vs|VS)\s+(New Zealand|South Africa|NZ|RSA)/i);
+    if (teamMatch) teams = teamMatch[0];
 
-    // Extract scores
-    const scores: string[] = [];
-    $(el).find("span.font-medium.wb\\:font-semibold").each((j, span) => {
-      scores.push($(span).text().trim());
-    });
-
-    // Extract result
+    // Try to extract result
     let result = '';
-    const resultEl = $(el).find("div.text-cbComplete").first();
-    if (resultEl.length) {
-      result = resultEl.text().trim();
-    }
+    const resultMatch = text.match(/(New Zealand|South Africa)\s+won\s+by\s+[\d\s]+(runs|wkts)/i);
+    if (resultMatch) result = resultMatch[0];
 
-    // Extract venue
+    // Try to extract venue
     let venue = '';
-    const infoSpan = $(el).find("span.text-xs.text-cbTxtSec").first();
-    if (infoSpan.length) {
-      const infoText = infoSpan.text().trim();
-      const parts = infoText.split("•").map(s => s.trim());
-      venue = parts.length > 1 ? parts[1] : '';
-    }
+    const venueMatch = text.match(/•\s*([^•]+?)(?:\d|$)/);
+    if (venueMatch) venue = venueMatch[1].trim();
 
-    // Extract date
-    let date = '';
-    const dateSpan = $(el).find("span.text-cbTxtSec.text-xs").last();
-    if (dateSpan.length) {
-      date = dateSpan.text().trim();
-    }
+    // Date might be nearby – we'll leave blank for now
+    const date = '';
 
-    // Filter for NZ vs RSA
-    if (matchId && teams && (teams.includes('New Zealand') || teams.includes('South Africa'))) {
-      matches.push({ matchId, teams, score: scores, result, venue, date });
-      console.log(`[series] Added match: ${teams}`);
+    if (matchId && teams) {
+      matches.push({ matchId, teams, result, venue, date });
+      console.log(`[series] Added: ${teams} (${result})`);
     }
   });
 
