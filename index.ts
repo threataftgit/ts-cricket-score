@@ -79,43 +79,48 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 
 
 // ── NEW: Fetch series matches (completed/upcoming) ────────
+
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
-  // Use the matches page URL
   const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
   console.log(`[series] Fetching URL: ${url}`);
   const html = await fetchHTML(url);
   const $ = cheerio.load(html);
   const matches: any[] = [];
 
-  // Each match card is in a div with class "border-b p-4"
-  $("div.border-b.p-4").each((i, el) => {
-    // Extract match ID from the link
-    const link = $(el).find("a[href*='/live-cricket-scores/']").attr("href");
+  // Each match card is an anchor with these classes
+  $("a[href*='/live-cricket-scores/'].w-full.bg-cbWhite.flex.flex-col.p-3.gap-1").each((i, el) => {
+    const link = $(el).attr("href");
     const matchId = link ? link.split("/")[2] : null;
+    if (!matchId) return;
 
-    // Teams – inside <p class="font-bold">
-    const teams = $(el).find("p.font-bold").text().trim();
+    // Extract full team names (hidden on mobile, visible on desktop)
+    const teamSpans = $(el).find("span.hidden.wb\\:block.truncate.max-w-\\[100\\%\\]");
+    const teamNames: string[] = [];
+    teamSpans.each((j, span) => {
+      teamNames.push($(span).text().trim());
+    });
+    const teams = teamNames.join(" vs ");
 
-    // Venue – inside <span class="text-gray-500 text-xs ml-1">
-    const venue = $(el).find("span.text-gray-500.text-xs.ml-1").text().trim();
+    // Result
+    const result = $(el).find("div.text-cbComplete").text().trim();
 
-    // Result – inside <p class="text-[#a36501]"> (escape brackets)
-    const result = $(el).find("p.text-\\[#a36501\\]").text().trim();
+    // Venue – first span with match info (contains match number and venue)
+    const infoSpan = $(el).find("span.text-xs.text-cbTxtSec").first();
+    let venue = "";
+    if (infoSpan.length) {
+      const infoText = infoSpan.text().trim();
+      // Split on "•" and take the second part (venue)
+      const parts = infoText.split("•").map(s => s.trim());
+      venue = parts.length > 1 ? parts[1] : infoText;
+    }
 
-    // Date – try to find any nearby element with date info
-    // Often it's in a small text above the teams; adjust as needed
-    const date = $(el).find("div.text-xs.text-gray-500").first().text().trim() || "";
+    // Date – not directly available in this snippet; leave empty for now
+    const date = "";
 
-    console.log(`[series] Found match: id=${matchId}, teams=${teams}, result=${result}, venue=${venue}, date=${date}`);
+    console.log(`[series] Found match: id=${matchId}, teams=${teams}, result=${result}, venue=${venue}`);
 
     if (matchId && teams) {
-      matches.push({ 
-        matchId, 
-        teams, 
-        result: result || "Result pending", 
-        venue, 
-        date 
-      });
+      matches.push({ matchId, teams, result, venue, date });
     }
   });
 
