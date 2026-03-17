@@ -115,42 +115,80 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   const $ = cheerio.load(html);
   const matches: any[] = [];
 
+  // Find all links to match scorecards
   $("a[href*='/live-cricket-scores/']").each((i, el) => {
     const link = $(el).attr('href');
     const matchId = link ? link.split('/')[2] : null;
     if (!matchId) return;
 
-    const cardDiv = $(el).find('div.border-b.p-4');
-    if (cardDiv.length === 0) return;
+    // Walk up to find the card container
+    const cardDiv = $(el).parent().parent();
 
-    // Team short names
-    const teamDivs = cardDiv.find('div.font-semibold');
+    // Extract team names
+    const teamDivs = cardDiv.find('div.font-semibold, span.font-semibold');
     const team1 = teamDivs.first().text().trim();
-    const team2 = teamDivs.last().text().trim();
-    const teams = team1 && team2 ? `${team1} vs ${team2}` : '';
+    const team2 = teamDivs.length > 1 ? teamDivs.eq(1).text().trim() : '';
+    const teams = team1 && team2 && team1 !== team2 ? `${team1} vs ${team2}` : '';
 
-    // Scores (optional)
-    const scoreDivs = cardDiv.find('div.text-gray-700.text-sm');
+    // Extract scores
+    const scoreDivs = cardDiv.find('div.text-gray-700');
     const score1 = scoreDivs.first().text().trim();
-    const score2 = scoreDivs.last().text().trim();
+    const score2 = scoreDivs.length > 1 ? scoreDivs.eq(1).text().trim() : '';
 
-    // Result/status is always the last paragraph in the card
-    const result = cardDiv.find('p').last().text().trim();
+    // Extract result — scan ALL text nodes for match result keywords
+    let result = '';
 
-    // Venue
-    const venueEl = cardDiv.find('span.text-gray-500.text-xs.ml-1');
-    const venue = venueEl.text().trim();
+    // Method 1: look for keyword-matching text in any element
+    cardDiv.find('*').each((_i: number, resEl: any) => {
+      if (result) return false;
+      const txt = $(resEl).text().trim();
+      if (txt && /won by|tied|no result|drawn|abandoned/i.test(txt) && txt.length < 200) {
+        result = txt;
+        return false;
+      }
+    });
 
-    console.log(`[series] Found match: ID=${matchId}, teams=${teams}, result=${result}, venue=${venue}`);
+    // Method 2: any element whose class contains color hints (amber, orange = result text on cricbuzz)
+    if (!result) {
+      cardDiv.find('[class]').each((_i: number, resEl: any) => {
+        if (result) return false;
+        const cls = $(resEl).attr('class') || '';
+        if (cls.includes('a365') || cls.includes('amber') || cls.includes('orange') || cls.includes('yellow')) {
+          const txt = $(resEl).text().trim();
+          if (txt && txt.length > 5) { result = txt; return false; }
+        }
+      });
+    }
 
-    if (matchId && teams) {
-      matches.push({ matchId, teams, result, venue, date: '' });
+    // Method 3: get inner HTML and use regex to find result text between tags
+    if (!result) {
+      const rawHtml = cardDiv.html() || '';
+      const match = rawHtml.match(/won by[^<]{3,80}|tied|no result|drawn/i);
+      if (match) result = match[0].replace(/<[^>]+>/g, '').trim();
+    }
+
+    // Extract venue — look for location-style short text
+    let venue = '';
+    cardDiv.find('span[class*="gray"], span[class*="text-xs"]').each((_i: number, venEl: any) => {
+      if (venue) return false;
+      const txt = $(venEl).text().trim();
+      if (txt && txt.length > 3 && txt.length < 50 && !/\d{1,2}:\d{2}/.test(txt)) {
+        venue = txt; return false;
+      }
+    });
+
+    console.log(`[series] Match ID=${matchId} teams=${teams} result="${result}" venue=${venue}`);
+
+    if (matchId) {
+      matches.push({ matchId, teams: teams || `${team1} vs ${team2}`, score1, score2, result, venue, date: '' });
     }
   });
 
   console.log(`[series] Total matches extracted: ${matches.length}`);
   return matches;
 };
+
+
 
 
 
