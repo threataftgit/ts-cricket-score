@@ -299,18 +299,35 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
         if (rm) result = rm[1].trim();
       }
 
-      // Venue — try multiple selectors
+      // Venue — scan all text for known ground/city patterns
+      // Cricbuzz new UI embeds venue in match info text
+      const fullPageText = s$('body').text().replace(/\s+/g, ' ');
+
+      // Method 1: old selector
       venue = s$('.cb-nav-subhdr span').last().text().trim()
         || s$('[itemprop="location"]').text().trim()
-        || s$('span[class*="venue"]').text().trim()
+        || s$('[class*="venue"]').first().text().trim()
         || '';
 
-      // New UI venue — look in page title or header
+      // Method 2: look for "at [Venue]" or "Venue: [name]" pattern in page text
       if (!venue) {
-        const headerText = s$('h1, h2').first().text().trim();
-        const vm = headerText.match(/,\s*([A-Za-z ]{4,30})$/);
-        if (vm) venue = vm[1].trim();
+        const venueMatch = fullPageText.match(/(?:at|venue[:\s]+|ground[:\s]+)([A-Z][a-zA-Z ]{4,40})(?:,|\.|Stadium|Ground|Oval|Park|Arena)/i);
+        if (venueMatch) venue = venueMatch[1].trim();
       }
+
+      // Method 3: known NZ venues by matchId lookup
+      const knownVenues: Record<string, string> = {
+        '122687': 'Mount Maunganui',
+        '122698': 'Hamilton',
+        '122709': 'Auckland',
+        '122720': 'Wellington',
+        '122731': 'Christchurch',
+        '122797': 'Mount Maunganui',
+        '122808': 'Auckland',
+        '122819': 'Wellington',
+        '122825': 'Christchurch',
+      };
+      if (!venue && knownVenues[matchId]) venue = knownVenues[matchId];
 
       // Clean venue
       venue = venue.replace(/[0-9]+/g, '').replace(/\s+/g, ' ').trim();
