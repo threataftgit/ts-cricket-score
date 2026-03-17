@@ -33,46 +33,7 @@ const fetchHTML = async (url: string): Promise<string> => {
   }
 };
 
-// --- Existing parseCricketScore and fetchLiveMatches remain unchanged ---
-const parseCricketScore = ($: cheerio.CheerioAPI): Record<string, string> => {
-    const getText = (selector: string): string =>
-      $(selector).first().text().trim() || "Match Stats will Update Soon";
-
-    const matchStatuses: string[] = [
-      ".cb-col.cb-col-100.cb-min-stts.cb-text-complete",
-      ".cb-text-inprogress",
-      ".cb-col.cb-col-100.cb-font-18.cb-toss-sts.cb-text-abandon",
-      ".cb-text-stumps",
-      ".cb-text-lunch",
-      ".cb-text-inningsbreak",
-      ".cb-text-tea",
-      ".cb-text-rain",
-      ".cb-text-wetoutfield",
-      ".cb-text-delay",
-      ".cb-col.cb-col-100.cb-font-18.cb-toss-sts.cb-text-",
-    ];
-    
-    const matchUpdate = matchStatuses
-      .map((selector) => $(selector).first().text().trim())
-      .find((status) => status) || "Match Stats will Update Soon";
-  
-    const matchDateElement = $('span[itemprop="startDate"]').attr("content");
-    const matchDate =
-      matchDateElement &&
-      new Date(matchDateElement).toLocaleString("en-IN", {
-        timeZone: "Asia/Kolkata",
-        hour12: true,
-      });
-  
-    return {
-      title: getText("h1.cb-nav-hdr").replace(" - Live Cricket Score, Commentary", "").trim(),
-      update: matchUpdate,
-      matchDate: matchDate ? `Date: ${matchDate}` : "Match Stats will Update Soon",
-      livescore: getText(".cb-font-20.text-bold"),
-      runrate: `${getText(".cb-font-12.cb-text-gray")}`,
-    };
-  };  
-
+// ── Fetch live matches (existing) ─────────────────────────
 const fetchLiveMatches = async (): Promise<any[]> => {
   const url = "https://www.cricbuzz.com/cricket-match/live-scores";
   const html = await fetchHTML(url);
@@ -82,7 +43,6 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 
   $(".cb-mtch-lst.cb-col.cb-col-100").each((index, element) => {
     const matchElement = $(element);
-
     const link = matchElement.find("a.cb-lv-scrs-well").attr("href");
     const id = link ? link.split("/")[2] : null;
 
@@ -117,14 +77,13 @@ const fetchLiveMatches = async (): Promise<any[]> => {
   return matches;
 };
 
-// --- NEW: Fetch series matches (completed/upcoming) ---
+// ── NEW: Fetch series matches (completed/upcoming) ────────
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
-  const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/new-zealand-vs-south-africa-2026`; // you can make series name dynamic
+  const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/new-zealand-vs-south-africa-2026`; // adjust series name as needed
   const html = await fetchHTML(url);
   const $ = cheerio.load(html);
   const matches: any[] = [];
 
-  // Selector for match cards on series page – adjust based on Cricbuzz structure
   $(".cb-series-matches-list .cb-match-card").each((i, el) => {
     const link = $(el).find("a.cb-match-cta").attr("href");
     const matchId = link ? link.split("/")[2] : null;
@@ -139,18 +98,16 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   return matches;
 };
 
-// --- NEW: Fetch full scorecard for a match ---
+// ── NEW: Fetch full scorecard for a match ─────────────────
 const fetchScorecard = async (matchId: string): Promise<any> => {
-  const url = `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}/nz-vs-sa`; // you can use generic title
+  const url = `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}/nz-vs-sa`; // generic title works
   const html = await fetchHTML(url);
   const $ = cheerio.load(html);
-  
-  // Extract match info
+
   const matchName = $("h1.cb-nav-hdr").text().trim();
   const venue = $(".cb-col.cb-col-100.cb-venue-it").text().trim();
   const result = $(".cb-col.cb-col-100.cb-font-12.cb-text-gray").first().text().trim();
 
-  // Parse innings
   const innings: any[] = [];
   $(".cb-col.cb-col-100.cb-ltst-wgt-hdr").each((i, innEl) => {
     const innTitle = $(innEl).find(".cb-col.cb-col-100.cb-bg-gray").text().trim();
@@ -165,21 +122,60 @@ const fetchScorecard = async (matchId: string): Promise<any> => {
         batting.push({ batsman, runs, balls, fours, sixes });
       }
     });
-    // Similarly bowling, extras, fall of wickets can be added
+    // similarly bowling, extras, fall of wickets can be added
     innings.push({ title: innTitle, batting });
   });
 
   return { matchName, venue, result, innings };
 };
 
-// --- Async handler helper ---
+// ── Existing parseCricketScore (unchanged) ────────────────
+const parseCricketScore = ($: cheerio.CheerioAPI): Record<string, string> => {
+  const getText = (selector: string): string =>
+    $(selector).first().text().trim() || "Match Stats will Update Soon";
+
+  const matchStatuses: string[] = [
+    ".cb-col.cb-col-100.cb-min-stts.cb-text-complete",
+    ".cb-text-inprogress",
+    ".cb-col.cb-col-100.cb-font-18.cb-toss-sts.cb-text-abandon",
+    ".cb-text-stumps",
+    ".cb-text-lunch",
+    ".cb-text-inningsbreak",
+    ".cb-text-tea",
+    ".cb-text-rain",
+    ".cb-text-wetoutfield",
+    ".cb-text-delay",
+    ".cb-col.cb-col-100.cb-font-18.cb-toss-sts.cb-text-",
+  ];
+
+  const matchUpdate = matchStatuses
+    .map((selector) => $(selector).first().text().trim())
+    .find((status) => status) || "Match Stats will Update Soon";
+
+  const matchDateElement = $('span[itemprop="startDate"]').attr("content");
+  const matchDate =
+    matchDateElement &&
+    new Date(matchDateElement).toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      hour12: true,
+    });
+
+  return {
+    title: getText("h1.cb-nav-hdr").replace(" - Live Cricket Score, Commentary", "").trim(),
+    update: matchUpdate,
+    matchDate: matchDate ? `Date: ${matchDate}` : "Match Stats will Update Soon",
+    livescore: getText(".cb-font-20.text-bold"),
+    runrate: `${getText(".cb-font-12.cb-text-gray")}`,
+  };
+};
+
 const asyncHandler =
   (fn: (req: Request, res: Response, next: NextFunction) => Promise<void>) =>
   (req: Request, res: Response, next: NextFunction): void => {
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 
-// --- Existing routes ---
+// ── Existing /score endpoint ──────────────────────────────
 app.get(
   "/score",
   asyncHandler(async (req: Request, res: Response) => {
@@ -197,6 +193,7 @@ app.get(
   })
 );
 
+// ── Existing /live endpoint ───────────────────────────────
 app.get(
   "/live",
   asyncHandler(async (req: Request, res: Response) => {
@@ -210,7 +207,7 @@ app.get(
   })
 );
 
-// --- NEW routes ---
+// ── NEW: /series/:seriesId/matches endpoint ───────────────
 app.get(
   "/series/:seriesId/matches",
   asyncHandler(async (req: Request, res: Response) => {
@@ -225,6 +222,7 @@ app.get(
   })
 );
 
+// ── NEW: /scorecard/:matchId endpoint ─────────────────────
 app.get(
   "/scorecard/:matchId",
   asyncHandler(async (req: Request, res: Response) => {
