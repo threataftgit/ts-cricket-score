@@ -114,55 +114,46 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   const $ = cheerio.load(html);
   const matches: any[] = [];
 
+  // Find all links to match scorecards
   $("a[href*='/live-cricket-scores/']").each((i, el) => {
     const link = $(el).attr('href');
     const matchId = link ? link.split('/')[2] : null;
     if (!matchId) return;
 
+    // Locate the card container
     const cardDiv = $(el).find('div.border-b.p-4');
     if (cardDiv.length === 0) return;
 
-    // --- Extract full team names ---
-    let team1 = '', team2 = '';
-    // Look for the <span> with full team name (hidden on mobile but present)
-    const teamSpans = cardDiv.find('span.hidden.wb\\:block.truncate.max-w-\\[100\\%\\]');
-    if (teamSpans.length >= 2) {
-      team1 = $(teamSpans[0]).text().trim();
-      team2 = $(teamSpans[1]).text().trim();
-    } else {
-      // Fallback to short names if full names not found
-      const shortTeamDivs = cardDiv.find('div.font-semibold');
-      team1 = shortTeamDivs.first().text().trim();
-      team2 = shortTeamDivs.last().text().trim();
-    }
+    // Extract team short names (e.g., "NZ", "RSA")
+    const teamDivs = cardDiv.find('div.font-semibold');
+    const team1 = teamDivs.first().text().trim();
+    const team2 = teamDivs.last().text().trim();
     const teams = team1 && team2 ? `${team1} vs ${team2}` : '';
 
-    // --- Extract result (for completed matches) ---
-    const resultEl = cardDiv.find('p.text-\\[#a36501\\]');
-    let result = resultEl.text().trim();
+    // Extract scores (optional, can be used later)
+    const scoreDivs = cardDiv.find('div.text-gray-700.text-sm');
+    const score1 = scoreDivs.first().text().trim();
+    const score2 = scoreDivs.last().text().trim();
 
-    // --- Extract venue ---
+    // Extract result/status (the only paragraph in the card)
+    const result = cardDiv.find('p').first().text().trim();
+
+    // Extract venue
     const venueEl = cardDiv.find('span.text-gray-500.text-xs.ml-1');
     const venue = venueEl.text().trim();
 
-    // --- Extract date (if available) ---
-    let date = '';
-    // Sometimes the date is in a small text near the match description
-    const dateEl = cardDiv.find('span.text-xs.text-cbTxtSec').first();
-    if (dateEl.length) {
-      date = dateEl.text().trim();
-    }
-
-    console.log(`[series] Found match: ID=${matchId}, teams=${teams}, result=${result}, venue=${venue}, date=${date}`);
+    console.log(`[series] Found match: ID=${matchId}, teams=${teams}, result=${result}, venue=${venue}`);
 
     if (matchId && teams) {
-      matches.push({ matchId, teams, result, venue, date });
+      matches.push({ matchId, teams, result, venue, date: '' });
     }
   });
 
   console.log(`[series] Total matches extracted: ${matches.length}`);
   return matches;
 };
+
+
 
 
 
