@@ -357,6 +357,21 @@ app.get(
   })
 );
 
+app.get(
+  "/debug/series/:seriesId/html",
+  asyncHandler(async (req: Request, res: Response) => {
+    const seriesId = req.params.seriesId;
+    const url = `https://www.cricbuzz.com/cricket-series/${seriesId}/matches`;
+    try {
+      const html = await fetchHTML(url);
+      res.setHeader('Content-Type', 'text/html');
+      res.send(html);
+    } catch (err) {
+      res.status(500).send("Error fetching HTML");
+    }
+  })
+);
+
 // 404 handler
 app.use((req: Request, res: Response) => {
   res.status(404).json({ error: 'Resource not found' });
