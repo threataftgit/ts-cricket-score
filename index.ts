@@ -253,8 +253,14 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
       // No -vs- slug — try to infer teams from match number pattern
       // e.g. "3rd-t20i-south-africa-tour-of-new-zealand-2026"
       // Parse: get tour teams from series context
-      if (slug.includes('south-africa') && slug.includes('new-zealand')) {
-        teams = 'NZ vs RSA';
+      if ((slug.includes('south-africa') || slug.includes('rsa')) &&
+          (slug.includes('new-zealand') || slug.includes('nz'))) {
+        // Check if women's match
+        if (slug.includes('-w-') || slug.includes('women') || slug.includes('-nzw') || slug.includes('rsaw')) {
+          teams = 'NZW vs RSAW';
+        } else {
+          teams = 'NZ vs RSA';
+        }
       } else if (slug.includes('new-zealand') && slug.includes('south-africa')) {
         teams = 'NZ vs RSA';
       } else {
@@ -317,15 +323,20 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
 
       // Method 3: known NZ venues by matchId lookup
       const knownVenues: Record<string, string> = {
-        '122687': 'Mount Maunganui',
-        '122698': 'Hamilton',
-        '122709': 'Auckland',
-        '122720': 'Wellington',
-        '122731': 'Christchurch',
-        '122797': 'Mount Maunganui',
-        '122808': 'Auckland',
-        '122819': 'Wellington',
-        '122825': 'Christchurch',
+        // Men NZ vs SA T20I
+        '122687': 'Bay Oval, Mount Maunganui',
+        '122698': 'Seddon Park, Hamilton',
+        '122709': 'Eden Park, Auckland',
+        '122720': 'Sky Stadium, Wellington',
+        '122731': 'Hagley Oval, Christchurch',
+        // Men NZ vs SA ODI
+        '122808': 'Eden Park, Auckland',
+        '122819': 'Sky Stadium, Wellington',
+        '122825': 'Hagley Oval, Christchurch',
+        // Women NZ vs SA T20I
+        '122797': 'Seddon Park, Hamilton',
+        '122836': 'Bay Oval, Mount Maunganui',
+        '122847': 'Bay Oval, Mount Maunganui',
       };
       if (!venue && knownVenues[matchId]) venue = knownVenues[matchId];
 
@@ -339,7 +350,7 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
     }
 
     console.log(`[series] ID=${matchId} teams="${teams}" result="${result}" venue="${venue}"`);
-    matches.push({ matchId, teams, score1: '', score2: '', result, venue, date: '' });
+    matches.push({ matchId, slug, teams, score1: '', score2: '', result, venue, date: '' });
   }
 
   console.log(`[series] Total: ${matches.length}`);
@@ -358,8 +369,16 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
 
 
 // ── Fetch full scorecard for a match ─────────────────
-const fetchScorecard = async (matchId: string): Promise<any> => {
-  const url = `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}/nz-vs-sa`;
+const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
+  // Try to get the correct slug from our series cache
+  let matchSlug = slug || 'cricket-scorecard';
+  // Search series caches for this matchId to get the slug
+  for (const seriesData of Object.values(seriesCache)) {
+    const match = (seriesData as any).data?.find((m: any) => m.matchId === matchId);
+    if (match) { matchSlug = match.slug || matchSlug; break; }
+  }
+  const url = `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}/${matchSlug}`;
+  console.log(`[scorecard] Fetching: ${url}`);
   const html = await fetchHTMLWithBrowser(url);
   const $ = cheerio.load(html);
 
