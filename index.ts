@@ -456,12 +456,17 @@ let liveCacheTime = 0;
 const LIVE_CACHE_TTL = 60 * 1000; // 60 seconds
 
 // Background refresh — runs every 60s, doesn't block requests
+let lastLiveCount = -1;
 async function refreshLiveCache() {
   try {
     const matches = await fetchLiveMatches();
     liveMatchCache = matches;
     liveCacheTime = Date.now();
-    console.log(`[cache] Live matches updated: ${matches.length}`);
+    // Only log when count changes to reduce noise
+    if (matches.length !== lastLiveCount) {
+      console.log(`[cache] Live matches updated: ${matches.length}`);
+      lastLiveCount = matches.length;
+    }
   } catch (err) {
     console.error('[cache] Live refresh failed:', err);
   }
