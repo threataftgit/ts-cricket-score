@@ -39,22 +39,44 @@ const activePages = new Set<any>(); // FIX: track open pages to avoid leaks
 
 async function getSharedBrowser() {
   if (!sharedBrowser) {
-    // On Railway/Linux, use system Chrome if available; otherwise let Puppeteer find its own
-    const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH
-      || (() => {
-          const candidates = [
-            '/usr/bin/google-chrome-stable',
-            '/usr/bin/google-chrome',
-            '/usr/bin/chromium-browser',
-            '/usr/bin/chromium',
-          ];
-          const fs = require('fs');
-          return candidates.find(p => { try { return fs.existsSync(p); } catch { return false; } }) || undefined;
-        })();
+    const fs = require('fs');
+    const { execSync } = require('child_process');
+
+    // Find real Chromium — skip snap stubs which fail in Railway containers
+    const executablePath: string | undefined = process.env.PUPPETEER_EXECUTABLE_PATH || (() => {
+      // 1. Try `which chromium` — skip snap wrappers
+      try {
+        const w = execSync('which chromium', { timeout: 3000 }).toString().trim();
+        if (w && !w.includes('snap') && fs.existsSync(w)) return w;
+      } catch {}
+
+      // 2. Search Nix store for real chromium binary
+      try {
+        const found = execSync(
+          'find /nix/store -name "chromium" -type f 2>/dev/null | grep "/bin/chromium$" | head -1',
+          { timeout: 5000 }
+        ).toString().trim();
+        if (found && fs.existsSync(found)) return found;
+      } catch {}
+
+      // 3. Common Nix profile paths
+      const candidates = [
+        '/nix/var/nix/profiles/default/bin/chromium',
+        '/root/.nix-profile/bin/chromium',
+        '/usr/local/bin/chromium',
+      ];
+      for (const p of candidates) {
+        try { if (fs.existsSync(p)) return p; } catch {}
+      }
+
+      return undefined;
+    })();
+
+    console.log(`[browser] Using: ${executablePath || 'puppeteer bundled chrome'}`);
 
     sharedBrowser = await puppeteer.launch({
       headless: true,
-      executablePath,          // undefined = Puppeteer uses its own bundled Chrome
+      executablePath,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -69,7 +91,7 @@ async function getSharedBrowser() {
         '--mute-audio',
       ],
     });
-    console.log(`[browser] Shared browser started (${executablePath || 'bundled Chrome'})`);
+    console.log('[browser] Shared browser started');
     sharedBrowser.on('disconnected', () => {
       console.log('[browser] Browser disconnected — will restart on next request');
       sharedBrowser = null;
@@ -639,6 +661,82 @@ app.get(
       res.send(html);
     } catch (err) {
       res.status(500).send("Error: " + (err instanceof Error ? err.message : String(err)));
+    }
+  })
+);
+
+// ── /schedule — auto-fetches results + upcoming from Cricbuzz ─────────────────
+// Returns structured match data for the active international series
+// Called by sportvibe-live server every 5 minutes — no manual updates needed
+
+let scheduleData: any = null;
+let scheduleTime = 0;
+const SCHEDULE_TTL = 5 * 60 * 1000; // 5 min cache
+
+async function buildSchedule(): Promise<any> {
+  // Fetch current international schedules from Cricbuzz
+  const url = 'https://www.cricbuzz.com/cricket-schedule/upcoming-series/international';
+  const html = await fetchHTMLWithBrowser(url);
+  const $ = cheerio.load(html);
+
+  const series: any[] = [];
+
+  // Parse each schedule item
+  $('.cb-col-100.cb-col.cb-ltst-wgt-hdr').each((_i: number, el: any) => {
+    const seriesName = $(el).find('a').first().text().trim();
+    if (!seriesName) return;
+
+    const matches: any[] = [];
+    $(el).nextUntil('.cb-col-100.cb-col.cb-ltst-wgt-hdr', '.cb-col-100.cb-col').each((_j: number, row: any) => {
+      const link      = $(row).find('a').first();
+      const matchText = link.text().trim();
+      const href      = link.attr('href') || '';
+      const dateText  = $(row).find('.schedule-date').text().trim()
+                     || $(row).find('span[data-timestamp]').attr('data-timestamp') || '';
+
+      const statusEl = $(row).find('.cb-text-complete, .cb-text-inprogress, .cb-text-live');
+      const status   = statusEl.length ? 'result' : 'upcoming';
+      const result   = $(row).find('.cb-text-complete').text().trim();
+
+      if (matchText) {
+        const ts = parseInt(dateText);
+        matches.push({
+          title:   matchText,
+          href,
+          matchId: href.split('/')[2] || '',
+          status,
+          result:  result || null,
+          startMs: ts > 0 ? ts : null,
+          startUTC: ts > 0 ? new Date(ts).toISOString() : null,
+        });
+      }
+    });
+
+    if (matches.length > 0) {
+      series.push({ seriesName, matches });
+    }
+  });
+
+  return { series, fetchedAt: new Date().toISOString() };
+}
+
+app.get(
+  '/schedule',
+  asyncHandler(async (req: Request, res: Response) => {
+    const now = Date.now();
+    if (scheduleData && now - scheduleTime < SCHEDULE_TTL) {
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      return res.json({ ...scheduleData, cached: true });
+    }
+    try {
+      scheduleData = await buildSchedule();
+      scheduleTime = now;
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.json(scheduleData);
+    } catch (err) {
+      // Return stale data if available
+      if (scheduleData) return res.json({ ...scheduleData, stale: true });
+      res.status(500).json({ error: 'Schedule fetch failed', detail: (err as Error).message });
     }
   })
 );
