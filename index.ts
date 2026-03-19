@@ -474,17 +474,21 @@ const parseCricketScore = ($: cheerio.CheerioAPI): Record<string, string> => {
     .find(status => status) || "Match Stats will Update Soon";
 
   const matchDateElement = $('span[itemprop="startDate"]').attr("content");
-  const matchDate =
-    matchDateElement &&
-    new Date(matchDateElement).toLocaleString("en-IN", {
-      timeZone: "Asia/Kolkata",
-      hour12: true,
-    });
+  // Send raw UTC ISO string — client will format in user's local timezone
+  const matchDateUTC = matchDateElement ? new Date(matchDateElement).toISOString() : null;
 
   return {
     title: getText("h1.cb-nav-hdr").replace(" - Live Cricket Score, Commentary", "").trim(),
     update: matchUpdate,
-    matchDate: matchDate ? `Date: ${matchDate}` : "Match Stats will Update Soon",
+    matchDate: matchDateUTC,          // raw UTC ISO string
+    matchDateFormatted: matchDateUTC  // alias for backward compat
+      ? new Date(matchDateUTC).toLocaleString("en-IN", {
+          timeZone: "Asia/Kolkata",
+          hour12: true,
+          day: "2-digit", month: "short", year: "numeric",
+          hour: "2-digit", minute: "2-digit"
+        }) + " IST"
+      : "Match Stats will Update Soon",
     livescore: getText(".cb-font-20.text-bold"),
     runrate: `${getText(".cb-font-12.cb-text-gray")}`,
   };
