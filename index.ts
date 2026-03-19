@@ -493,12 +493,12 @@ const parseCricketScore = ($: cheerio.CheerioAPI): Record<string, string> => {
 
   const matchDateElement = $('span[itemprop="startDate"]').attr("content");
   // Send raw UTC ISO string — client will format in user's local timezone
-  const matchDateUTC = matchDateElement ? new Date(matchDateElement).toISOString() : null;
+  const matchDateUTC = matchDateElement ? new Date(matchDateElement).toISOString() : '';
 
   return {
     title: getText("h1.cb-nav-hdr").replace(" - Live Cricket Score, Commentary", "").trim(),
     update: matchUpdate,
-    matchDate: matchDateUTC,          // raw UTC ISO string
+    matchDate: matchDateUTC,          // raw UTC ISO string (empty string if unavailable)
     matchDateFormatted: matchDateUTC  // alias for backward compat
       ? new Date(matchDateUTC).toLocaleString("en-IN", {
           timeZone: "Asia/Kolkata",
