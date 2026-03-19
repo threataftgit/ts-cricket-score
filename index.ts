@@ -429,6 +429,46 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
 };
 
 // ── Fetch scorecard ───────────────────────────────────────
+// ── Scorecard cache ───────────────────────────────────────────────────────────
+const scorecardCache: Record<string, { data: any; ts: number }> = {};
+const SCORECARD_TTL = 10 * 60 * 1000;
+
+// ── CricAPI scorecard — clean JSON, no scraping, works for all IPL matches ───
+async function fetchScorecardFromAPI(matchId: string): Promise<any | null> {
+  const apiKey = process.env.CRICKET_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const url = `https://api.cricapi.com/v1/match_scorecard?apikey=${apiKey}&id=${matchId}`;
+    const res  = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) { console.warn(`[scorecard] CricAPI HTTP ${res.status}`); return null; }
+    const json = await res.json();
+    if (json.status !== 'success' || !json.data) return null;
+    const d = json.data;
+    const innings: any[] = [];
+    for (const inn of (d.scorecard || [])) {
+      const batting: any[] = [];
+      for (const b of (inn.batting || [])) {
+        if (b.batsman?.name && b.r !== undefined) {
+          batting.push({ batsman: b.batsman.name, runs: String(b.r ?? 0), balls: String(b.b ?? 0), fours: String(b["4s"] ?? 0), sixes: String(b["6s"] ?? 0) });
+        }
+      }
+      const bowling: any[] = [];
+      for (const b of (inn.bowling || [])) {
+        if (b.bowler?.name && b.o !== undefined) {
+          bowling.push({ bowler: b.bowler.name, overs: String(b.o), maidens: String(b.m ?? 0), runs: String(b.r ?? 0), wickets: String(b.w ?? 0) });
+        }
+      }
+      if (batting.length || bowling.length) {
+        innings.push({ title: inn.inning || `Innings ${innings.length + 1}`, batting, bowling });
+      }
+    }
+    return { matchName: d.name || "", venue: d.venue || "", result: d.status || "", innings, source: "cricapi" };
+  } catch (e: any) {
+    console.warn("[scorecard] CricAPI error:", e.message);
+    return null;
+  }
+}
+
 // Known slugs for completed matches — avoids depending on series cache
 const KNOWN_SLUGS: Record<string, string> = {
   '122687': 'new-zealand-vs-south-africa-1st-t20i',
@@ -441,6 +481,22 @@ const KNOWN_SLUGS: Record<string, string> = {
 };
 
 const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
+  // Check cache first
+  const cached = scorecardCache[matchId];
+  if (cached && Date.now() - cached.ts < SCORECARD_TTL) {
+    console.log(`[scorecard] Cache hit: ${matchId}`);
+    return cached.data;
+  }
+
+  // Try CricAPI first — works for ALL matches including IPL, no scraping
+  const apiResult = await fetchScorecardFromAPI(matchId);
+  if (apiResult && apiResult.innings?.length > 0) {
+    scorecardCache[matchId] = { data: apiResult, ts: Date.now() };
+    console.log(`[scorecard] CricAPI success: ${matchId}`);
+    return apiResult;
+  }
+
+  // Fallback: Puppeteer scraper (only for NZ vs SA with known slugs)
   // Priority: explicit slug → known slugs map → series cache → generic fallback
   let matchSlug = slug
     || KNOWN_SLUGS[matchId]
@@ -597,25 +653,186 @@ app.get(
   })
 );
 
-// ── Live match cache ─────────────────────────────────────
-let liveMatchCache: any[] = [];
-let liveCacheTime = 0;
-const LIVE_CACHE_TTL = 60 * 1000; // 60 seconds
-let lastLiveCount = -1;
 
-async function refreshLiveCache() {
+// ── Live match cache + source health tracking ─────────────────────────────────
+let liveMatchCache: any[] = [];
+let liveCacheTime  = 0;
+let lastLiveCount  = -1;
+const LIVE_CACHE_TTL = 60 * 1000; // 60 seconds
+
+// Track which data source is working
+const sourceHealth = {
+  cricbuzz: { healthy: true,  failures: 0, lastOk: 0 },
+  cricapi:  { healthy: false, failures: 0, lastOk: 0 },
+};
+
+// ── CricAPI live scores — backup when Cricbuzz is blocked ────────────────────
+async function fetchLiveMatchesCricAPI(): Promise<any[]> {
+  const apiKey = process.env.CRICKET_API_KEY;
+  if (!apiKey) return [];
   try {
-    const matches = await fetchLiveMatches();
-    liveMatchCache = matches;
-    liveCacheTime = Date.now();
-    if (matches.length !== lastLiveCount) {
-      console.log(`[cache] Live matches updated: ${matches.length}`);
-      lastLiveCount = matches.length;
-    }
-  } catch (err) {
-    console.error('[cache] Live refresh failed:', err);
+    const res = await fetch(
+      `https://api.cricapi.com/v1/currentMatches?apikey=${apiKey}&offset=0`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) return [];
+    const json = await res.json();
+    if (json.status !== 'success' || !json.data) return [];
+
+    sourceHealth.cricapi.healthy = true;
+    sourceHealth.cricapi.lastOk  = Date.now();
+    sourceHealth.cricapi.failures = 0;
+
+    return json.data
+      .filter((m: any) => m.matchStarted && !m.matchEnded)
+      .map((m: any) => {
+        // Parse score into standard format
+        const scores: any[] = (m.score || []).map((s: any, i: number) => ({
+          r: parseInt(s.r) || 0,
+          w: parseInt(s.w) || 0,
+          o: parseFloat(s.o) || 0,
+          inning: i === 0 ? '1st' : '2nd',
+        }));
+
+        const teams = m.teams || [];
+        return {
+          id:             m.id,
+          name:           m.name || `${teams[0]} vs ${teams[1]}`,
+          teams,
+          status:         'live',
+          venue:          m.venue || '',
+          score:          scores,
+          matchType:      (m.matchType || 'T20').toUpperCase(),
+          battingTeamIdx: 0,
+          isLive:         true,
+          source:         'cricapi',
+        };
+      });
+  } catch (e: any) {
+    sourceHealth.cricapi.failures++;
+    console.warn('[backup] CricAPI live failed:', e.message);
+    return [];
   }
 }
+
+// ── RapidAPI live scores — second backup ─────────────────────────────────────
+async function fetchLiveMatchesRapidAPI(): Promise<any[]> {
+  const apiKey = process.env.RAPIDAPI_KEY;
+  if (!apiKey) return [];
+  try {
+    const res = await fetch(
+      'https://cricbuzz-cricket.p.rapidapi.com/matches/v1/live',
+      {
+        headers: {
+          'X-RapidAPI-Key':  apiKey,
+          'X-RapidAPI-Host': 'cricbuzz-cricket.p.rapidapi.com',
+        },
+        signal: AbortSignal.timeout(8000),
+      }
+    );
+    if (!res.ok) return [];
+    const json = await res.json();
+    const matches: any[] = [];
+
+    for (const typeMatches of (json.typeMatches || [])) {
+      for (const seriesMatch of (typeMatches.seriesMatches || [])) {
+        for (const m of (seriesMatch.seriesAdWrapper?.matches || [])) {
+          const mi = m.matchInfo;
+          const ms = m.matchScore;
+          if (!mi || mi.state !== 'In Progress') continue;
+
+          const t1 = mi.team1?.teamSName || mi.team1?.teamName || '';
+          const t2 = mi.team2?.teamSName || mi.team2?.teamName || '';
+          const inn1 = ms?.team1Score?.inngs1;
+          const inn2 = ms?.team2Score?.inngs1;
+          const scores = [];
+          if (inn1) scores.push({ r: inn1.runs || 0, w: inn1.wickets || 0, o: inn1.overs || 0, inning: '1st' });
+          if (inn2) scores.push({ r: inn2.runs || 0, w: inn2.wickets || 0, o: inn2.overs || 0, inning: '2nd' });
+
+          matches.push({
+            id:             String(mi.matchId),
+            name:           `${t1} vs ${t2}`,
+            teams:          [t1, t2],
+            status:         'live',
+            venue:          mi.venueInfo?.ground || '',
+            score:          scores,
+            matchType:      (mi.matchFormat || 'T20').toUpperCase(),
+            battingTeamIdx: 0,
+            isLive:         true,
+            source:         'rapidapi',
+          });
+        }
+      }
+    }
+    console.log(`[backup] RapidAPI live: ${matches.length} matches`);
+    return matches;
+  } catch (e: any) {
+    console.warn('[backup] RapidAPI live failed:', e.message);
+    return [];
+  }
+}
+
+// ── Smart refresh — Cricbuzz primary, auto-fallback to APIs ──────────────────
+async function refreshLiveCache() {
+  // Try Cricbuzz first (primary — most detailed data)
+  if (sourceHealth.cricbuzz.healthy || sourceHealth.cricbuzz.failures < 3) {
+    try {
+      const matches = await fetchLiveMatches();
+      if (matches.length > 0 || sourceHealth.cricbuzz.lastOk > Date.now() - 300_000) {
+        liveMatchCache  = matches;
+        liveCacheTime   = Date.now();
+        sourceHealth.cricbuzz.healthy  = true;
+        sourceHealth.cricbuzz.failures = 0;
+        sourceHealth.cricbuzz.lastOk   = Date.now();
+        if (matches.length !== lastLiveCount) {
+          console.log(`[cache] Cricbuzz: ${matches.length} live matches`);
+          lastLiveCount = matches.length;
+        }
+        return;
+      }
+    } catch (err: any) {
+      sourceHealth.cricbuzz.failures++;
+      sourceHealth.cricbuzz.healthy = sourceHealth.cricbuzz.failures < 3;
+      console.warn(`[cache] Cricbuzz failed (${sourceHealth.cricbuzz.failures}/3):`, err.message);
+    }
+  }
+
+  // Cricbuzz failed — try CricAPI
+  console.log('[cache] Switching to CricAPI backup...');
+  const cricapiMatches = await fetchLiveMatchesCricAPI();
+  if (cricapiMatches.length > 0) {
+    liveMatchCache = cricapiMatches;
+    liveCacheTime  = Date.now();
+    if (cricapiMatches.length !== lastLiveCount) {
+      console.log(`[cache] CricAPI backup: ${cricapiMatches.length} live matches`);
+      lastLiveCount = cricapiMatches.length;
+    }
+    return;
+  }
+
+  // CricAPI also failed — try RapidAPI
+  console.log('[cache] Switching to RapidAPI backup...');
+  const rapidMatches = await fetchLiveMatchesRapidAPI();
+  if (rapidMatches.length > 0) {
+    liveMatchCache = rapidMatches;
+    liveCacheTime  = Date.now();
+    console.log(`[cache] RapidAPI backup: ${rapidMatches.length} live matches`);
+    lastLiveCount  = rapidMatches.length;
+    return;
+  }
+
+  // All sources failed — keep stale cache
+  console.error('[cache] ALL sources failed — keeping stale data');
+}
+
+// Retry Cricbuzz every 5 minutes even when it's marked unhealthy
+setInterval(() => {
+  if (!sourceHealth.cricbuzz.healthy) {
+    console.log('[cache] Retrying Cricbuzz...');
+    sourceHealth.cricbuzz.failures = 0;
+    sourceHealth.cricbuzz.healthy  = true;
+  }
+}, 5 * 60 * 1000);
 
 refreshLiveCache();
 setInterval(refreshLiveCache, LIVE_CACHE_TTL);
@@ -682,11 +899,20 @@ app.get('/health', (req: Request, res: Response) => {
     browser: sharedBrowser ? 'running' : 'not_started',
     activePages: activePages.size,
     liveCache: {
-      count: liveMatchCache.length,
+      count:      liveMatchCache.length,
       ageSeconds: Math.round((Date.now() - liveCacheTime) / 1000),
+      source:     liveMatchCache[0]?.source || 'cricbuzz',
+    },
+    sources: {
+      cricbuzz: { healthy: sourceHealth.cricbuzz.healthy, failures: sourceHealth.cricbuzz.failures },
+      cricapi:  { healthy: sourceHealth.cricapi.healthy,  failures: sourceHealth.cricapi.failures  },
+    },
+    apis: {
+      cricketApi: !!process.env.CRICKET_API_KEY,
+      rapidApi:   !!process.env.RAPIDAPI_KEY,
     },
     seriesCached: Object.keys(seriesCache).length,
-    uptime: process.uptime(),
+    uptime: Math.round(process.uptime()),
   });
 });
 
