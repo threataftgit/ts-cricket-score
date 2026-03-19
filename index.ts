@@ -726,7 +726,8 @@ app.get(
     const now = Date.now();
     if (scheduleData && now - scheduleTime < SCHEDULE_TTL) {
       res.setHeader('Cache-Control', 'public, max-age=300');
-      return res.json({ ...scheduleData, cached: true });
+      res.json({ ...scheduleData, cached: true });
+      return;
     }
     try {
       scheduleData = await buildSchedule();
@@ -734,8 +735,10 @@ app.get(
       res.setHeader('Cache-Control', 'public, max-age=300');
       res.json(scheduleData);
     } catch (err) {
-      // Return stale data if available
-      if (scheduleData) return res.json({ ...scheduleData, stale: true });
+      if (scheduleData) {
+        res.json({ ...scheduleData, stale: true });
+        return;
+      }
       res.status(500).json({ error: 'Schedule fetch failed', detail: (err as Error).message });
     }
   })
