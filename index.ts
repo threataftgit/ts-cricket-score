@@ -429,63 +429,104 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
 };
 
 // ── Fetch scorecard ───────────────────────────────────────
+// Known slugs for completed matches — avoids depending on series cache
+const KNOWN_SLUGS: Record<string, string> = {
+  '122687': 'new-zealand-vs-south-africa-1st-t20i',
+  '122698': 'new-zealand-vs-south-africa-2nd-t20i',
+  '122808': 'new-zealand-vs-south-africa-3rd-t20i',
+  '122819': 'new-zealand-vs-south-africa-4th-t20i',
+  '122825': 'new-zealand-vs-south-africa-5th-t20i',
+  '122786': 'new-zealand-women-vs-south-africa-women-1st-t20i',
+  '122797': 'new-zealand-women-vs-south-africa-women-2nd-t20i',
+};
+
 const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
-  let matchSlug = slug || 'cricket-scorecard';
-  for (const seriesData of Object.values(seriesCache)) {
-    const match = (seriesData as any).data?.find((m: any) => m.matchId === matchId);
-    if (match) { matchSlug = match.slug || matchSlug; break; }
-  }
+  // Priority: explicit slug → known slugs map → series cache → generic fallback
+  let matchSlug = slug
+    || KNOWN_SLUGS[matchId]
+    || (() => {
+        for (const seriesData of Object.values(seriesCache)) {
+          const match = (seriesData as any).data?.find((m: any) => m.matchId === matchId);
+          if (match?.slug) return match.slug;
+        }
+        return null;
+      })()
+    || 'cricket-scorecard';
 
   const url = `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}/${matchSlug}`;
   console.log(`[scorecard] Fetching: ${url}`);
   const html = await fetchHTMLWithBrowser(url);
   const $ = cheerio.load(html);
 
-  const matchName = $("h1.cb-nav-hdr").text().trim();
-  const venue = $(".cb-col.cb-col-100.cb-venue-it").text().trim();
-  const result = $(".cb-col.cb-col-100.cb-font-12.cb-text-gray").first().text().trim();
+  // Try multiple selectors — Cricbuzz layout differs for live vs completed
+  const matchName = $("h1.cb-nav-hdr").first().text().trim()
+    || $(".cb-nav-hdr").first().text().trim();
+
+  const venue = $(".cb-col.cb-col-100.cb-venue-it").text().trim()
+    || $("[class*='venue']").first().text().trim();
+
+  const result = $(".cb-col.cb-col-100.cb-min-stts").first().text().trim()
+    || $(".cb-text-complete").first().text().trim()
+    || $(".cb-col.cb-col-100.cb-font-12.cb-text-gray").first().text().trim();
 
   const innings: any[] = [];
 
-  $(".cb-col.cb-col-100.cb-ltst-wgt-hdr").each((i, innEl) => {
-    const innTitle = $(innEl).find(".cb-col.cb-col-100.cb-bg-gray").text().trim();
+  // Try main innings container — works for both live and completed
+  const innContainers = $(".cb-col.cb-col-100.cb-ltst-wgt-hdr");
 
-    // Batting
+  innContainers.each((i: number, innEl: any) => {
+    const innTitle = $(innEl).find(".cb-col.cb-col-100.cb-bg-gray").text().trim()
+      || $(innEl).find("[class*='cb-bg-gray']").first().text().trim()
+      || `Innings ${i + 1}`;
+
+    // Batting rows
     const batting: any[] = [];
-    $(innEl).find(".cb-col.cb-col-100.cb-scrd-itms").each((j, row) => {
+    $(innEl).find(".cb-col.cb-col-100.cb-scrd-itms").each((j: number, row: any) => {
       const batsman = $(row).find(".cb-col.cb-col-27").text().trim();
-      const runs = $(row).find(".cb-col.cb-col-8.text-bold").text().trim();
-      const balls = $(row).find(".cb-col.cb-col-8").eq(1).text().trim();
-      const fours = $(row).find(".cb-col.cb-col-8").eq(2).text().trim();
-      const sixes = $(row).find(".cb-col.cb-col-8").eq(3).text().trim();
-      if (batsman && runs && !isNaN(Number(runs))) {
+      const allEight = $(row).find(".cb-col.cb-col-8");
+      const runs    = $(row).find(".cb-col.cb-col-8.text-bold").first().text().trim()
+                   || allEight.eq(0).text().trim();
+      const balls   = allEight.eq(1).text().trim();
+      const fours   = allEight.eq(2).text().trim();
+      const sixes   = allEight.eq(3).text().trim();
+
+      if (batsman && runs && !isNaN(Number(runs)) && Number(runs) >= 0) {
         batting.push({ batsman, runs, balls, fours, sixes });
       }
     });
 
-    // FIX: extract bowling data (was completely missing before)
+    // Bowling rows — identified by .cb-col-40 (wider bowler name column)
     const bowling: any[] = [];
-    $(innEl).find(".cb-col.cb-col-100.cb-scrd-itms").each((j, row) => {
-      const bowler = $(row).find(".cb-col.cb-col-40").text().trim();
-      const cols = $(row).find(".cb-col.cb-col-8");
-      const overs  = cols.eq(0).text().trim();
+    $(innEl).find(".cb-col.cb-col-100.cb-scrd-itms").each((j: number, row: any) => {
+      const bowler  = $(row).find(".cb-col.cb-col-40").text().trim();
+      const cols    = $(row).find(".cb-col.cb-col-8");
+      const overs   = cols.eq(0).text().trim();
       const maidens = cols.eq(1).text().trim();
       const runs_b  = cols.eq(2).text().trim();
       const wickets = cols.eq(3).text().trim();
-      // bowling rows have overs as a number like "4.0"
-      if (bowler && overs && !isNaN(Number(overs))) {
+
+      if (bowler && overs && !isNaN(Number(overs)) && Number(overs) > 0) {
         bowling.push({
           bowler,
           overs,
           maidens: maidens || '0',
-          runs: runs_b,
+          runs: runs_b || '0',
           wickets: wickets || '0',
         });
       }
     });
 
-    innings.push({ title: innTitle, batting, bowling });
+    // Only push innings that have actual data
+    if (batting.length > 0 || bowling.length > 0) {
+      innings.push({ title: innTitle, batting, bowling });
+    }
   });
+
+  // If no innings parsed, log the page HTML snippet for debugging
+  if (innings.length === 0) {
+    const snippet = $('body').text().substring(0, 300).replace(/\s+/g, ' ');
+    console.warn(`[scorecard] No innings found for ${matchId}. Page snippet: ${snippet}`);
+  }
 
   return { matchName, venue, result, innings };
 };
