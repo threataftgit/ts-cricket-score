@@ -39,8 +39,22 @@ const activePages = new Set<any>(); // FIX: track open pages to avoid leaks
 
 async function getSharedBrowser() {
   if (!sharedBrowser) {
+    // On Railway/Linux, use system Chrome if available; otherwise let Puppeteer find its own
+    const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH
+      || (() => {
+          const candidates = [
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/google-chrome',
+            '/usr/bin/chromium-browser',
+            '/usr/bin/chromium',
+          ];
+          const fs = require('fs');
+          return candidates.find(p => { try { return fs.existsSync(p); } catch { return false; } }) || undefined;
+        })();
+
     sharedBrowser = await puppeteer.launch({
       headless: true,
+      executablePath,          // undefined = Puppeteer uses its own bundled Chrome
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -49,13 +63,17 @@ async function getSharedBrowser() {
         '--no-first-run',
         '--no-zygote',
         '--single-process',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--mute-audio',
       ],
     });
-    console.log('[browser] Shared browser started');
+    console.log(`[browser] Shared browser started (${executablePath || 'bundled Chrome'})`);
     sharedBrowser.on('disconnected', () => {
       console.log('[browser] Browser disconnected — will restart on next request');
       sharedBrowser = null;
-      activePages.clear(); // FIX: drop all tracked pages from dead browser
+      activePages.clear();
     });
   }
   return sharedBrowser;
