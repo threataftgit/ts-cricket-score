@@ -892,7 +892,7 @@ app.get(
   })
 );
 
-// ── FIX: /health endpoint (was missing entirely) ─────────
+// ── /health endpoint (was missing entirely) ─────────
 app.get('/health', (req: Request, res: Response) => {
   res.json({
     status: 'ok',
@@ -915,6 +915,179 @@ app.get('/health', (req: Request, res: Response) => {
     uptime: Math.round(process.uptime()),
   });
 });
+
+// ── /prematch/:matchId — scrape squads, venue, head-to-head ──
+// Called by match-agent 90min before, and by match.html on load.
+// Scrapes Cricbuzz match page for:
+//  - Playing XIs (when confirmed)
+//  - Toss result (when available)
+//  - Venue info + pitch report
+//  - Head-to-head record
+//  - Umpires
+const prematchCache: Record<string, { data: any; ts: number }> = {};
+const PREMATCH_TTL = 5 * 60 * 1000; // 5 min cache
+
+app.get(
+  '/prematch/:matchId',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { matchId } = req.params;
+    const slug = req.query.slug as string || '';
+
+    // Cache hit
+    const cached = prematchCache[matchId];
+    if (cached && Date.now() - cached.ts < PREMATCH_TTL) {
+      res.json({ ...cached.data, cached: true });
+      return;
+    }
+
+    // Resolve slug from known slugs or query
+    const KNOWN_SLUGS: Record<string, string> = {
+      '122720': 'new-zealand-vs-south-africa-4th-t20i',
+      '122731': 'new-zealand-vs-south-africa-5th-t20i',
+      '122847': 'new-zealand-women-vs-south-africa-women-4th-t20i',
+      '122858': 'new-zealand-women-vs-south-africa-women-5th-t20i',
+    };
+    const matchSlug = slug || KNOWN_SLUGS[matchId] || 'cricket-match';
+
+    try {
+      const url  = `https://www.cricbuzz.com/live-cricket-scores/${matchId}/${matchSlug}`;
+      console.log(`[prematch] Fetching: ${url}`);
+      const html = await fetchHTMLWithBrowser(url);
+      const $    = cheerio.load(html);
+
+      // ── Toss ──────────────────────────────────────────────
+      let toss = $('.cb-toss-sts').first().text().trim()
+        || $('.cb-text-inprogress').first().text().trim()
+        || '';
+      // Clean up toss text
+      if (toss && !/won toss/i.test(toss)) toss = '';
+
+      // ── Match status / result ─────────────────────────────
+      const status = $('.cb-text-complete').first().text().trim()
+        || $('.cb-min-stts').first().text().trim()
+        || '';
+
+      // ── Venue ─────────────────────────────────────────────
+      let venue = $('[itemprop="location"]').text().trim()
+        || $('.cb-nav-subhdr span').last().text().trim()
+        || '';
+      if (!venue) {
+        const bodyText = $('body').text().replace(/\s+/g, ' ');
+        const vm = bodyText.match(/(?:at|venue)[:\s]+([A-Z][^,\n]{5,60})/i);
+        if (vm) venue = vm[1].trim();
+      }
+
+      // ── Match date ────────────────────────────────────────
+      const matchDateEl = $('span[itemprop="startDate"]').attr('content');
+      const matchDate   = matchDateEl ? new Date(matchDateEl).toISOString() : '';
+
+      // ── Playing XIs ───────────────────────────────────────
+      // Cricbuzz shows XIs inside .cb-minfo-tm-nm / .cb-player-name divs
+      const teams: any[] = [];
+      $('.cb-minfo-tm-nm').each((_i: number, el: any) => {
+        const teamName = $(el).find('.cb-font-16').first().text().trim()
+          || $(el).text().trim().split('\n')[0].trim();
+        const players: string[] = [];
+        $(el).find('.cb-player-name, .cb-col-50').each((_j: number, p: any) => {
+          const name = $(p).text().trim();
+          if (name && name.length > 2 && name.length < 40 && !/squad|playing|xi/i.test(name)) {
+            players.push(name);
+          }
+        });
+        if (teamName && players.length > 0) {
+          teams.push({ name: teamName, players: players.slice(0, 11) });
+        }
+      });
+
+      // Fallback: try alternate XI selectors
+      if (teams.length === 0) {
+        const xiBlocks = $('.cb-col-100.cb-col.cb-teams-ng-itm');
+        xiBlocks.each((_i: number, block: any) => {
+          const teamName = $(block).find('.cb-col-67').first().text().trim();
+          const players: string[] = [];
+          $(block).find('.cb-col-50, .cb-player-name').each((_j: number, p: any) => {
+            const name = $(p).text().trim();
+            if (name && name.length > 2 && name.length < 40) players.push(name);
+          });
+          if (teamName && players.length > 0) {
+            teams.push({ name: teamName, players: players.slice(0, 11) });
+          }
+        });
+      }
+
+      // ── Umpires ───────────────────────────────────────────
+      let umpires = '';
+      $('*').each((_i: number, el: any) => {
+        if (umpires) return false as any;
+        const text = $(el).text().trim();
+        if (/umpire/i.test(text) && text.length < 200 && $(el).children().length < 3) {
+          umpires = text.replace(/\s+/g, ' ').trim();
+        }
+      });
+
+      // ── Head-to-head ──────────────────────────────────────
+      // Try to extract from page (Cricbuzz sometimes shows this)
+      let h2h = '';
+      $('*').each((_i: number, el: any) => {
+        if (h2h) return false as any;
+        const text = $(el).text().trim();
+        if (/head.to.head|h2h/i.test(text) && text.length < 300 && $(el).children().length < 5) {
+          h2h = text.replace(/\s+/g, ' ').trim();
+        }
+      });
+
+      // ── Pitch report ──────────────────────────────────────
+      let pitch = '';
+      $('*').each((_i: number, el: any) => {
+        if (pitch) return false as any;
+        const text = $(el).text().trim();
+        if (/pitch|track|surface|conditions/i.test(text) && text.length > 30 && text.length < 400
+            && $(el).children().length < 4 && /batting|bowling|pace|spin|flat/i.test(text)) {
+          pitch = text.replace(/\s+/g, ' ').trim();
+        }
+      });
+
+      // ── Win probability (simple, from CricAPI if key available) ──
+      let winProb = { team1: 50, team2: 50 };
+      const apiKey = process.env.CRICKET_API_KEY;
+      if (apiKey) {
+        try {
+          const apiRes = await fetch(
+            `https://api.cricapi.com/v1/match_info?apikey=${apiKey}&id=${matchId}`,
+            { signal: AbortSignal.timeout(6000) }
+          );
+          if (apiRes.ok) {
+            const apiData = await apiRes.json();
+            if (apiData.data?.toss && !toss) toss = apiData.data.toss;
+            if (apiData.data?.venue && !venue) venue = apiData.data.venue;
+          }
+        } catch { /* non-critical */ }
+      }
+
+      const result = {
+        matchId,
+        toss,
+        status,
+        venue,
+        matchDate,
+        teams,          // [{ name, players[] }]
+        umpires,
+        h2h,
+        pitch,
+        winProb,
+        scrapedAt: new Date().toISOString(),
+      };
+
+      prematchCache[matchId] = { data: result, ts: Date.now() };
+      console.log(`[prematch] ${matchId}: toss="${toss}" teams=${teams.length} venue="${venue}"`);
+      res.json(result);
+
+    } catch (err: any) {
+      console.error(`[prematch] Failed for ${matchId}:`, err.message);
+      res.status(500).json({ error: 'Pre-match data unavailable', matchId });
+    }
+  })
+);
 
 // ── Debug: raw HTML ───────────────────────────────────────
 app.get(
