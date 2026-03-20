@@ -471,13 +471,18 @@ async function fetchScorecardFromAPI(matchId: string): Promise<any | null> {
 
 // Known slugs for completed matches — avoids depending on series cache
 const KNOWN_SLUGS: Record<string, string> = {
+  // Men's NZ vs SA
   '122687': 'new-zealand-vs-south-africa-1st-t20i',
   '122698': 'new-zealand-vs-south-africa-2nd-t20i',
-  '122808': 'new-zealand-vs-south-africa-3rd-t20i',
-  '122819': 'new-zealand-vs-south-africa-4th-t20i',
-  '122825': 'new-zealand-vs-south-africa-5th-t20i',
-  '122786': 'new-zealand-women-vs-south-africa-women-1st-t20i',
+  '122709': 'new-zealand-vs-south-africa-3rd-t20i',
+  '122720': 'new-zealand-vs-south-africa-4th-t20i',
+  '122731': 'new-zealand-vs-south-africa-5th-t20i',
+  // Women's NZ vs SA
+  '122783': 'new-zealand-women-vs-south-africa-women-1st-t20i',
   '122797': 'new-zealand-women-vs-south-africa-women-2nd-t20i',
+  '122836': 'new-zealand-women-vs-south-africa-women-3rd-t20i',
+  '122847': 'new-zealand-women-vs-south-africa-women-4th-t20i',
+  '122858': 'new-zealand-women-vs-south-africa-women-5th-t20i',
 };
 
 const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
