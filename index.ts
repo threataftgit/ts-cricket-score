@@ -120,14 +120,16 @@ const fetchHTMLWithBrowser = async (url: string): Promise<string> => {
     });
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-    // FIX: smart wait — wait for meaningful content selectors instead of blind 1500ms sleep
+    // FIX: wait for either old cb-* selectors OR new table-based UI
     try {
       await page.waitForSelector(
-        '.cb-min-stts, .cb-text-complete, .cb-text-inprogress, a[href*="/live-cricket-scores/"], .cb-scrd-itms',
-        { timeout: 5000 }
+        '.cb-min-stts, .cb-text-complete, .cb-text-inprogress, ' +
+        'a[href*="/live-cricket-scores/"], .cb-scrd-itms, ' +
+        'table th, [class*="scorecard"], [class*="innings"]',
+        { timeout: 6000 }
       );
     } catch {
-      // selector didn't appear in time — proceed with whatever loaded
+      // selector didn't appear — proceed with whatever loaded
     }
 
     return await page.content();
@@ -514,33 +516,69 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
       })()
     || 'cricket-scorecard';
 
-  const url = `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}/${matchSlug}`;
-  console.log(`[scorecard] Fetching: ${url}`);
-  const html = await fetchHTMLWithBrowser(url);
-  const $ = cheerio.load(html);
+  // Try scorecard URL, then live-scores URL as fallback
+  const urlsToTry = [
+    `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}/${matchSlug}`,
+    `https://www.cricbuzz.com/live-cricket-scores/${matchId}/${matchSlug}`,
+  ];
 
-  // Try multiple selectors — Cricbuzz layout differs for live vs completed
+  let html = '';
+  let usedUrl = '';
+  for (const tryUrl of urlsToTry) {
+    try {
+      console.log(`[scorecard] Fetching: ${tryUrl}`);
+      html = await fetchHTMLWithBrowser(tryUrl);
+      if (html.length > 10000) { usedUrl = tryUrl; break; }
+    } catch(e: any) {
+      console.warn(`[scorecard] Fetch failed ${tryUrl}: ${e.message}`);
+    }
+  }
+
+  if (!html) return { matchName: '', venue: '', result: '', innings: [] };
+
+  const $ = cheerio.load(html);
+  const fullText = $('body').text().replace(/\s+/g, ' ').trim();
+
+  // ── Match meta ────────────────────────────────────────────
   const matchName = $("h1.cb-nav-hdr").first().text().trim()
-    || $(".cb-nav-hdr").first().text().trim();
+    || $(".cb-nav-hdr").first().text().trim()
+    || $('h1').first().text().trim()
+    || '';
 
   const venue = $(".cb-col.cb-col-100.cb-venue-it").text().trim()
-    || $("[class*='venue']").first().text().trim();
+    || $("[class*='venue']").first().text().trim()
+    || $('[itemprop="location"]').text().trim()
+    || '';
 
-  const result = $(".cb-col.cb-col-100.cb-min-stts").first().text().trim()
+  let result = $(".cb-col.cb-col-100.cb-min-stts").first().text().trim()
     || $(".cb-text-complete").first().text().trim()
-    || $(".cb-col.cb-col-100.cb-font-12.cb-text-gray").first().text().trim();
+    || $(".cb-col.cb-col-100.cb-font-12.cb-text-gray").first().text().trim()
+    || '';
+  if (!result) {
+    // Scan all elements for result text
+    $('*').each((_i: number, el: any) => {
+      if (result) return false as any;
+      if ($(el).children().length > 2) return;
+      const txt = $(el).text().trim();
+      if (txt && txt.length < 150 &&
+          /won by \d+ (?:runs?|wickets?|wkts?)|tied|drawn|no result|abandoned/i.test(txt)) {
+        result = txt;
+      }
+    });
+  }
 
   const innings: any[] = [];
 
-  // Try main innings container — works for both live and completed
+  // ══════════════════════════════════════════════════════════
+  // STRATEGY 1 — Old Cricbuzz class-based selectors
+  // Works on pages that haven't migrated to new Tailwind UI
+  // ══════════════════════════════════════════════════════════
   const innContainers = $(".cb-col.cb-col-100.cb-ltst-wgt-hdr");
-
   innContainers.each((i: number, innEl: any) => {
     const innTitle = $(innEl).find(".cb-col.cb-col-100.cb-bg-gray").text().trim()
       || $(innEl).find("[class*='cb-bg-gray']").first().text().trim()
       || `Innings ${i + 1}`;
 
-    // Batting rows
     const batting: any[] = [];
     $(innEl).find(".cb-col.cb-col-100.cb-scrd-itms").each((j: number, row: any) => {
       const batsman = $(row).find(".cb-col.cb-col-27").text().trim();
@@ -550,13 +588,11 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
       const balls   = allEight.eq(1).text().trim();
       const fours   = allEight.eq(2).text().trim();
       const sixes   = allEight.eq(3).text().trim();
-
       if (batsman && runs && !isNaN(Number(runs)) && Number(runs) >= 0) {
         batting.push({ batsman, runs, balls, fours, sixes });
       }
     });
 
-    // Bowling rows — identified by .cb-col-40 (wider bowler name column)
     const bowling: any[] = [];
     $(innEl).find(".cb-col.cb-col-100.cb-scrd-itms").each((j: number, row: any) => {
       const bowler  = $(row).find(".cb-col.cb-col-40").text().trim();
@@ -565,31 +601,144 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
       const maidens = cols.eq(1).text().trim();
       const runs_b  = cols.eq(2).text().trim();
       const wickets = cols.eq(3).text().trim();
-
       if (bowler && overs && !isNaN(Number(overs)) && Number(overs) > 0) {
-        bowling.push({
-          bowler,
-          overs,
-          maidens: maidens || '0',
-          runs: runs_b || '0',
-          wickets: wickets || '0',
-        });
+        bowling.push({ bowler, overs, maidens: maidens || '0', runs: runs_b || '0', wickets: wickets || '0' });
       }
     });
 
-    // Only push innings that have actual data
     if (batting.length > 0 || bowling.length > 0) {
       innings.push({ title: innTitle, batting, bowling });
     }
   });
 
-  // If no innings parsed, log the page HTML snippet for debugging
+  // ══════════════════════════════════════════════════════════
+  // STRATEGY 2 — New Cricbuzz Tailwind UI: table-based
+  // New UI uses <table> with <th> "Batter"/"Bowler" headers
+  // ══════════════════════════════════════════════════════════
   if (innings.length === 0) {
-    const snippet = $('body').text().substring(0, 300).replace(/\s+/g, ' ');
-    console.warn(`[scorecard] No innings found for ${matchId}. Page snippet: ${snippet}`);
+    console.log(`[scorecard] Strategy 1 found 0 innings — trying Strategy 2 (tables)`);
+
+    let currentInnings: { title: string; batting: any[]; bowling: any[] } | null = null;
+
+    // Detect inning boundary headers
+    $('h2, h3, [class*="inning"], [class*="innings"], [class*="header"]').each((_i: number, el: any) => {
+      const text = $(el).text().trim();
+      if (/innings|1st inn|2nd inn|batting/i.test(text) && text.length < 150) {
+        if (currentInnings && (currentInnings.batting.length > 0 || currentInnings.bowling.length > 0)) {
+          innings.push(currentInnings);
+        }
+        currentInnings = { title: text, batting: [], bowling: [] };
+      }
+    });
+
+    // Parse all tables
+    $('table').each((_i: number, table: any) => {
+      const headers = $(table).find('th').map((_j: number, th: any) =>
+        $(th).text().trim().toLowerCase()
+      ).get() as string[];
+
+      const rows = $(table).find('tr').filter((_j: number, tr: any) =>
+        $(tr).find('td').length > 0
+      );
+
+      // Batting table: "batter" or "batsman" in headers
+      if (headers.some((h: string) => h.includes('batter') || h.includes('batsman'))) {
+        const batData: any[] = [];
+        rows.each((_j: number, row: any) => {
+          const cells = $(row).find('td').map((_k: number, td: any) =>
+            $(td).text().trim()
+          ).get() as string[];
+          // cells: [name, dismissal, R, B, 4s, 6s, SR]
+          if (cells.length >= 3 && cells[0] && /^\d+$/.test(cells[2] || '')) {
+            batData.push({
+              batsman:   cells[0].replace(/\s*\(c\)|\s*\†/g, '').trim(),
+              dismissal: cells[1] || '',
+              runs:      cells[2] || '0',
+              balls:     cells[3] || '0',
+              fours:     cells[4] || '0',
+              sixes:     cells[5] || '0',
+            });
+          }
+        });
+        if (batData.length > 0) {
+          if (!currentInnings) currentInnings = { title: `Innings ${innings.length + 1}`, batting: [], bowling: [] };
+          (currentInnings as any).batting.push(...batData);
+        }
+      }
+
+      // Bowling table: "bowler" in headers
+      if (headers.some((h: string) => h.includes('bowler'))) {
+        const bowlData: any[] = [];
+        rows.each((_j: number, row: any) => {
+          const cells = $(row).find('td').map((_k: number, td: any) =>
+            $(td).text().trim()
+          ).get() as string[];
+          // cells: [name, O, M, R, W, Econ]
+          if (cells.length >= 4 && cells[0] && /^\d+\.?\d*$/.test(cells[1] || '')) {
+            bowlData.push({
+              bowler:  cells[0].replace(/\s*\(c\)/g, '').trim(),
+              overs:   cells[1] || '0',
+              maidens: cells[2] || '0',
+              runs:    cells[3] || '0',
+              wickets: cells[4] || '0',
+              economy: cells[5] || '',
+            });
+          }
+        });
+        if (bowlData.length > 0) {
+          if (!currentInnings) currentInnings = { title: `Innings ${innings.length + 1}`, batting: [], bowling: [] };
+          (currentInnings as any).bowling.push(...bowlData);
+        }
+      }
+    });
+
+    if (currentInnings && ((currentInnings as any).batting.length > 0 || (currentInnings as any).bowling.length > 0)) {
+      innings.push(currentInnings as any);
+    }
   }
 
-  return { matchName, venue, result, innings };
+  // ══════════════════════════════════════════════════════════
+  // STRATEGY 3 — Generic JSON-LD / script tag data
+  // Cricbuzz sometimes embeds match data in JSON-LD <script> tags
+  // ══════════════════════════════════════════════════════════
+  if (innings.length === 0) {
+    console.log(`[scorecard] Strategy 2 found 0 innings — trying Strategy 3 (JSON-LD)`);
+    $('script[type="application/ld+json"]').each((_i: number, el: any) => {
+      if (innings.length > 0) return false as any;
+      try {
+        const json = JSON.parse($(el).html() || '{}');
+        if (json['@type'] === 'SportsEvent' && json.subEvent) {
+          for (const inningData of json.subEvent) {
+            const batting: any[] = [];
+            if (inningData.performer?.length) {
+              for (const p of inningData.performer) {
+                if (p.name && p.description) {
+                  const runs = p.description.match(/(\d+)\s*runs?/i)?.[1] || '0';
+                  batting.push({ batsman: p.name, runs, balls: '0', fours: '0', sixes: '0' });
+                }
+              }
+            }
+            if (batting.length > 0) {
+              innings.push({ title: inningData.name || `Innings ${innings.length + 1}`, batting, bowling: [] });
+            }
+          }
+        }
+      } catch { /* invalid JSON */ }
+    });
+  }
+
+  // ── Final logging ─────────────────────────────────────────
+  if (innings.length === 0) {
+    console.warn(`[scorecard] All strategies failed for ${matchId}. URL: ${usedUrl}`);
+    console.warn(`[scorecard] Page snippet: ${fullText.substring(0, 300)}`);
+  } else {
+    console.log(`[scorecard] ${matchId}: ${innings.length} innings, ${innings[0]?.batting?.length || 0} batters | url: ${usedUrl}`);
+  }
+
+  const scraped = { matchName, venue, result, innings };
+  // Cache even partial results — better than hitting Cricbuzz every time
+  scorecardCache[matchId] = { data: scraped, ts: Date.now() };
+  return scraped;
 };
 
 // ── Existing parseCricketScore (unchanged) ────────────────
