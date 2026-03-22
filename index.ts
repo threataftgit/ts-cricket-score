@@ -178,8 +178,6 @@ const fetchLiveMatches = async (): Promise<any[]> => {
     const card = $(el).parent().parent();
     const cardText = card.text().replace(/\s+/g, ' ').trim().substring(0, 500);
     const isLive = /live|batting|bowling|(?:[0-9]+\/[0-9]+)|yet to bat|in progress/i.test(cardText);
-    // FIX: also treat as live if there's a score present in the card regardless of keyword
-    const hasScore = scores.length > 0;
 
     // Get text from leaf nodes only
     const textOnly = card.find('*').map((_: number, el: any) => {
@@ -209,6 +207,9 @@ const fetchLiveMatches = async (): Promise<any[]> => {
         if (scores.length >= 2) break;
       }
     }
+
+    // FIX: hasScore must be declared AFTER scores is built (moved from above to fix TS2448)
+    const hasScore = scores.length > 0;
 
     // Venue extraction
     let venue = '';
