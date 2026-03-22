@@ -769,14 +769,41 @@ const parseCricketScore = ($: cheerio.CheerioAPI): Record<string, string> => {
     .find(status => status) || "Match Stats will Update Soon";
 
   const matchDateElement = $('span[itemprop="startDate"]').attr("content");
-  // Send raw UTC ISO string — client will format in user's local timezone
   const matchDateUTC = matchDateElement ? new Date(matchDateElement).toISOString() : '';
+
+  // FIX: try multiple selectors for livescore — Cricbuzz changed their UI classes.
+  // Old UI: .cb-font-20.text-bold | New UI: various score display classes
+  const livescoreSelectors = [
+    ".cb-font-20.text-bold",           // old Cricbuzz UI
+    ".cb-lv-scrs-well strong",         // live score well
+    ".cb-min-bat-rw .cb-lv-scrs",      // batting row score
+    "[class*='cb-scrs-wrp'] strong",   // score wrapper
+    ".cb-scrs-wrp .cb-font-20",        // score wrapper font
+    ".cb-min-inf .cb-font-20",         // match info score
+  ];
+
+  let livescore = '';
+  for (const sel of livescoreSelectors) {
+    const val = $(sel).first().text().trim();
+    if (val && val !== 'Match Stats will Update Soon' && /\d/.test(val)) {
+      livescore = val;
+      break;
+    }
+  }
+
+  // FIX: if still empty, try scraping score from body text using regex
+  if (!livescore) {
+    const bodyText = $('body').text().replace(/\s+/g, ' ');
+    // Look for patterns like "RSA 45/2 (8.3 Ov)" or "45/2 (8.3)"
+    const scoreMatch = bodyText.match(/([A-Z]{2,4}\s+)?\d{1,3}\/\d{1,2}\s*\(\d{1,2}\.?\d*\s*[Oo]v/);
+    if (scoreMatch) livescore = scoreMatch[0].trim();
+  }
 
   return {
     title: getText("h1.cb-nav-hdr").replace(" - Live Cricket Score, Commentary", "").trim(),
     update: matchUpdate,
-    matchDate: matchDateUTC,          // raw UTC ISO string (empty string if unavailable)
-    matchDateFormatted: matchDateUTC  // alias for backward compat
+    matchDate: matchDateUTC,
+    matchDateFormatted: matchDateUTC
       ? new Date(matchDateUTC).toLocaleString("en-IN", {
           timeZone: "Asia/Kolkata",
           hour12: true,
@@ -784,7 +811,7 @@ const parseCricketScore = ($: cheerio.CheerioAPI): Record<string, string> => {
           hour: "2-digit", minute: "2-digit"
         }) + " IST"
       : "Match Stats will Update Soon",
-    livescore: getText(".cb-font-20.text-bold"),
+    livescore: livescore || getText(".cb-font-20.text-bold"),
     runrate: `${getText(".cb-font-12.cb-text-gray")}`,
   };
 };
@@ -807,7 +834,15 @@ app.get(
     const url = `https://www.cricbuzz.com/live-cricket-scores/${id}`;
     const html = await fetchHTML(url);
     const $ = cheerio.load(html);
-    res.json(parseCricketScore($));
+    const result = parseCricketScore($);
+    // FIX: log what we actually got so we can debug empty livescore
+    if (!result.livescore || result.livescore === 'Match Stats will Update Soon') {
+      const snippet = $('body').text().replace(/\s+/g, ' ').substring(0, 300);
+      console.log(`[score] id=${id} livescore empty. Page snippet: ${snippet}`);
+    } else {
+      console.log(`[score] id=${id} livescore="${result.livescore}" update="${result.update}"`);
+    }
+    res.json(result);
   })
 );
 
