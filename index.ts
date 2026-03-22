@@ -177,7 +177,9 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 
     const card = $(el).parent().parent();
     const cardText = card.text().replace(/\s+/g, ' ').trim().substring(0, 500);
-    const isLive = /live|batting|bowling|(?:[0-9]+\/[0-9]+)/i.test(cardText);
+    const isLive = /live|batting|bowling|(?:[0-9]+\/[0-9]+)|yet to bat|in progress/i.test(cardText);
+    // FIX: also treat as live if there's a score present in the card regardless of keyword
+    const hasScore = scores.length > 0;
 
     // Get text from leaf nodes only
     const textOnly = card.find('*').map((_: number, el: any) => {
@@ -244,7 +246,8 @@ const fetchLiveMatches = async (): Promise<any[]> => {
       team1: team1 || slug.split('-')[0].toUpperCase(),
       team2: team2 || (slug.split('-')[2] || '').toUpperCase(),
       teams: [team1, team2].filter(Boolean),
-      status: isLive ? 'live' : 'upcoming',
+      status: (isLive || hasScore) ? 'live' : 'upcoming',
+      isLive: isLive || hasScore,
       venue,
       score: scores,
       matchType,
@@ -812,7 +815,12 @@ app.get(
 let liveMatchCache: any[] = [];
 let liveCacheTime  = 0;
 let lastLiveCount  = -1;
-const LIVE_CACHE_TTL = 60 * 1000; // 60 seconds
+// FIX: adaptive cache TTL — 30s during match hours (4am–11pm UTC), 90s otherwise
+function getLiveCacheTTL(): number {
+  const h = new Date().getUTCHours();
+  return (h >= 4 && h <= 17) ? 30 * 1000 : 90 * 1000;
+}
+const LIVE_CACHE_TTL = 30 * 1000; // used only for setInterval — adaptive TTL used in requests
 
 // Track which data source is working
 const sourceHealth = {
@@ -995,12 +1003,18 @@ setInterval(refreshLiveCache, LIVE_CACHE_TTL);
 app.get(
   "/live",
   asyncHandler(async (req: Request, res: Response) => {
-    const age = Math.round((Date.now() - liveCacheTime) / 1000);
+    const age = Date.now() - liveCacheTime;
+    // FIX: force refresh if cache is older than adaptive TTL (was always serving stale cache)
+    if (age > getLiveCacheTTL()) {
+      await refreshLiveCache();
+    }
+    const ageSeconds = Math.round((Date.now() - liveCacheTime) / 1000);
     res.json({
-      matches: liveMatchCache,
-      cached: true,
-      ageSeconds: age,
-      count: liveMatchCache.length,
+      matches:    liveMatchCache,
+      cached:     true,
+      ageSeconds,
+      count:      liveMatchCache.length,
+      source:     liveMatchCache[0]?.source || 'cricbuzz',
     });
   })
 );
@@ -1096,9 +1110,12 @@ app.get(
 
     // Resolve slug from known slugs or query
     const KNOWN_SLUGS: Record<string, string> = {
-      '122720': 'new-zealand-vs-south-africa-4th-t20i',
+      // Men's NZ vs SA — remaining
+      '122720': 'new-zealand-vs-south-africa-4th-t20i',  // TODAY — 11:45 IST
       '122731': 'new-zealand-vs-south-africa-5th-t20i',
-      '122847': 'new-zealand-women-vs-south-africa-women-4th-t20i',
+      // Women's NZ vs SA — remaining
+      '122836': 'new-zealand-women-vs-south-africa-women-3rd-t20i', // FIX: was missing
+      '122847': 'new-zealand-women-vs-south-africa-women-4th-t20i', // TODAY — in progress
       '122858': 'new-zealand-women-vs-south-africa-women-5th-t20i',
     };
     const matchSlug = slug || KNOWN_SLUGS[matchId] || 'cricket-match';
