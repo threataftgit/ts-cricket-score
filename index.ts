@@ -899,13 +899,13 @@ app.get(
       }
     });
 
-    const result = {
+    const result: any = {
       ...baseResult,
       batters,
       bowlers,
       recentBalls,
       partnership,
-      toss: toss || baseResult.toss || '',
+      toss: toss || (baseResult as any).toss || '',
     };
 
     if (!result.livescore || result.livescore === 'Match Stats will Update Soon') {
