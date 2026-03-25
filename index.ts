@@ -822,110 +822,153 @@ const asyncHandler =
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 
-// ── /score endpoint — uses Puppeteer for JS-rendered live data ───────────────
+// ── /score endpoint — intercepts Cricbuzz XHR for live score ─────────────────
 app.get(
   "/score",
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.query.id as string;
-    if (!id) {
-      res.status(400).json({ error: "Match ID is required" });
-      return;
-    }
-    const url = `https://www.cricbuzz.com/live-cricket-scores/${id}`;
+    if (!id) { res.status(400).json({ error: "Match ID is required" }); return; }
 
-    // Use Puppeteer — axios only gets static header HTML, not the JS-rendered scorecard
-    const html = await fetchHTMLWithBrowser(url);
-    const $ = cheerio.load(html);
-    const baseResult = parseCricketScore($);
-    const bodyText = $('body').text().replace(/\s+/g, ' ');
+    const browser = await getSharedBrowser();
+    const page = await browser.newPage();
+    activePages.add(page);
+    let miniScore: any = null;
 
-    // ── BATTERS ───────────────────────────────────────────────
-    const batters: any[] = [];
-    // Cricbuzz batter rows: .cb-min-bat-rw or table rows with player links
-    $('.cb-min-bat-rw').each((_i: number, el: any) => {
-      const cols = $(el).find('td');
-      if (cols.length < 5) return;
-      const nameEl = $(cols[0]).find('a').first();
-      const name = nameEl.text().trim() || $(cols[0]).text().trim();
-      if (!name || name.length < 2) return;
-      const runs = parseInt($(cols[1]).text().trim()) || 0;
-      const balls = parseInt($(cols[2]).text().trim()) || 0;
-      const fours = parseInt($(cols[3]).text().trim()) || 0;
-      const sixes = parseInt($(cols[4]).text().trim()) || 0;
-      const sr = cols.length > 5 ? parseFloat($(cols[5]).text().trim()) || 0 : 0;
-      batters.push({ name, runs, balls, fours, sixes, sr: sr.toFixed(2) });
-    });
+    try {
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36');
+      await page.setRequestInterception(true);
 
-    // ── BOWLERS ───────────────────────────────────────────────
-    const bowlers: any[] = [];
-    $('.cb-min-bowl-rw').each((_i: number, el: any) => {
-      const cols = $(el).find('td');
-      if (cols.length < 5) return;
-      const nameEl = $(cols[0]).find('a').first();
-      const name = nameEl.text().trim() || $(cols[0]).text().trim();
-      if (!name || name.length < 2) return;
-      const overs = $(cols[1]).text().trim();
-      const maidens = parseInt($(cols[2]).text().trim()) || 0;
-      const runs = parseInt($(cols[3]).text().trim()) || 0;
-      const wickets = parseInt($(cols[4]).text().trim()) || 0;
-      const economy = cols.length > 5 ? parseFloat($(cols[5]).text().trim()) || 0 : 0;
-      bowlers.push({ name, overs, maidens, runs, wickets, economy: economy.toFixed(2) });
-    });
+      page.on('request', (r: any) => {
+        if (['image','media','font','stylesheet'].includes(r.resourceType())) { r.abort(); return; }
+        r.continue();
+      });
 
-    // ── RECENT BALLS ─────────────────────────────────────────
-    let recentBalls: string[] = [];
-    const recentEl = $('.cb-col-100.cb-col.ng-binding').filter((_i: number, el: any) => {
-      return /^[0-9W\.\,\s]+$/.test($(el).text().trim());
-    }).first().text().trim();
-    if (recentEl) recentBalls = recentEl.split(/[\s,]+/).filter((b: string) => b.length > 0).slice(-12);
+      // Intercept Cricbuzz's internal score XHR calls
+      page.on('response', async (response: any) => {
+        const u = response.url();
+        try {
+          if (u.includes('cricbuzz.com') && (
+            u.includes(`/${id}/`) || u.includes(`matchId=${id}`) ||
+            u.includes('miniscore') || u.includes('mini-scorecard') ||
+            (u.includes('/api/') && u.includes('cricket'))
+          )) {
+            const ct = response.headers()['content-type'] || '';
+            if (ct.includes('json')) {
+              const data = await response.json().catch(() => null);
+              if (data && (data.miniscore || data.batTeam || data.scoreCard)) {
+                miniScore = data;
+                console.log(`[score] id=${id} XHR intercepted: ${u.replace('https://www.cricbuzz.com','')}`);
+              }
+            }
+          }
+        } catch {}
+      });
 
-    // ── PARTNERSHIP ──────────────────────────────────────────
-    let partnership = '';
-    $('*').each((_i: number, el: any) => {
-      if (partnership) return false as any;
-      const txt = $(el).text().trim();
-      if (/partnership/i.test(txt) && txt.length < 80 && $(el).children().length < 3) {
-        partnership = txt.replace(/\s+/g, ' ').trim();
+      const url = `https://www.cricbuzz.com/live-cricket-scores/${id}`;
+      await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
+      await new Promise(r => setTimeout(r, 3000));
+
+      const html = await page.content();
+      const $ = cheerio.load(html);
+      const baseResult = parseCricketScore($) as any;
+      const bodyText = $('body').text().replace(/\s+/g, ' ');
+
+      // Batters
+      const batters: any[] = [];
+      $('.cb-min-bat-rw').each((_i: number, el: any) => {
+        const cols = $(el).find('td');
+        if (cols.length < 5) return;
+        const name = $(cols[0]).find('a').first().text().trim() || $(cols[0]).text().trim();
+        if (!name || name.length < 2) return;
+        batters.push({ name,
+          runs: parseInt($(cols[1]).text().trim()) || 0,
+          balls: parseInt($(cols[2]).text().trim()) || 0,
+          fours: parseInt($(cols[3]).text().trim()) || 0,
+          sixes: parseInt($(cols[4]).text().trim()) || 0,
+        });
+      });
+
+      // Bowlers
+      const bowlers: any[] = [];
+      $('.cb-min-bowl-rw').each((_i: number, el: any) => {
+        const cols = $(el).find('td');
+        if (cols.length < 5) return;
+        const name = $(cols[0]).find('a').first().text().trim() || $(cols[0]).text().trim();
+        if (!name || name.length < 2) return;
+        bowlers.push({ name,
+          overs: $(cols[1]).text().trim(),
+          maidens: parseInt($(cols[2]).text().trim()) || 0,
+          runs: parseInt($(cols[3]).text().trim()) || 0,
+          wickets: parseInt($(cols[4]).text().trim()) || 0,
+        });
+      });
+
+      let recentBalls: string[] = [];
+      const recentEl = $('.cb-col-100.cb-col.ng-binding').filter((_i: number, el: any) =>
+        /^[0-9W\.\,\s]+$/.test($(el).text().trim())
+      ).first().text().trim();
+      if (recentEl) recentBalls = recentEl.split(/[\s,]+/).filter(Boolean).slice(-12);
+
+      let partnership = '';
+      $('*').each((_i: number, el: any) => {
+        if (partnership) return false as any;
+        const txt = $(el).text().trim();
+        if (/partnership/i.test(txt) && txt.length < 80 && $(el).children().length < 3)
+          partnership = txt.replace(/\s+/g, ' ').trim();
+      });
+
+      let toss = '';
+      $('*').each((_i: number, el: any) => {
+        if (toss) return false as any;
+        const txt = $(el).text().trim();
+        if (/won the toss|opt(ed)? to/i.test(txt) && txt.length < 120 && $(el).children().length < 3)
+          toss = txt.replace(/\s+/g, ' ').trim();
+      });
+
+      const result: any = { ...baseResult, batters, bowlers, recentBalls, partnership, toss: toss || baseResult.toss || '' };
+
+      // Use intercepted XHR mini-score (most reliable)
+      if (miniScore) {
+        const ms = miniScore.miniscore || miniScore;
+        const r = ms.batTeam?.teamScore ?? ms.runs;
+        const w = ms.batTeam?.teamWkts ?? ms.wickets;
+        const o = ms.overs;
+        if (r !== undefined) {
+          result.livescore = `${r}/${w ?? 0} (${o ?? 0} Ov)`;
+          console.log(`[score] id=${id} XHR score: ${result.livescore} batters:${batters.length}`);
+        }
       }
-    });
 
-    // ── TOSS ─────────────────────────────────────────────────
-    let toss = '';
-    $('*').each((_i: number, el: any) => {
-      if (toss) return false as any;
-      const txt = $(el).text().trim();
-      if (/won the toss|opt(ed)? to/i.test(txt) && txt.length < 120 && $(el).children().length < 3) {
-        toss = txt.replace(/\s+/g, ' ').trim();
-      }
-    });
-
-    const result: any = {
-      ...baseResult,
-      batters,
-      bowlers,
-      recentBalls,
-      partnership,
-      toss: toss || (baseResult as any).toss || '',
-    };
-
-    if (!result.livescore || result.livescore === 'Match Stats will Update Soon') {
-      // Menu text fallback for status
-      const matchMenuPattern = /(?:RSA\s+vs\s+NZ|NZ\s+vs\s+RSA|New Zealand\s+vs\s+South Africa|South Africa\s+vs\s+New Zealand|NZW\s+vs\s+RSAW|RSAW\s+vs\s+NZW|New Zealand Women\s+vs\s+South Africa Women|South Africa Women\s+vs\s+New Zealand Women)\s*[-–]\s*([^\|<"]{3,60})/i;
-      const menuMatch = bodyText.match(matchMenuPattern);
-      if (menuMatch) {
-        result.update = menuMatch[1].trim();
-        result.livescore = menuMatch[1].trim();
-        console.log(`[score] id=${id} menu fallback: "${result.update}"`);
+      // Body text fallback — look for X/Y (Z Ov) pattern
+      if (!result.livescore || result.livescore === 'Match Stats will Update Soon') {
+        const bodyScore = bodyText.match(/\b(\d{1,3})\/(\d{1,2})\s*\((\d{1,2}\.?\d*)\s*[Oo]v/);
+        if (bodyScore) {
+          result.livescore = `${bodyScore[1]}/${bodyScore[2]} (${bodyScore[3]} Ov)`;
+          console.log(`[score] id=${id} body: ${result.livescore}`);
+        } else {
+          // Nav menu fallback
+          const menuMatch = bodyText.match(/(?:NZ\s+vs\s+RSA|RSA\s+vs\s+NZ|New Zealand\s+vs\s+South Africa|South Africa\s+vs\s+New Zealand)\s*[-–]\s*([^\|<"]{3,60})/i);
+          if (menuMatch) {
+            result.update = menuMatch[1].trim();
+            result.livescore = menuMatch[1].trim();
+            console.log(`[score] id=${id} menu: "${result.update}"`);
+          } else {
+            console.log(`[score] id=${id} EMPTY bodyLen:${bodyText.length} batters:${batters.length}`);
+          }
+        }
       } else {
-        console.log(`[score] id=${id} livescore empty — batters:${batters.length} bowlers:${bowlers.length}`);
+        console.log(`[score] id=${id} "${result.livescore}" batters:${batters.length}`);
       }
-    } else {
-      console.log(`[score] id=${id} livescore="${result.livescore}" batters:${batters.length} bowlers:${bowlers.length}`);
-    }
 
-    res.json(result);
+      res.json(result);
+
+    } finally {
+      activePages.delete(page);
+      await page.close();
+    }
   })
 );
+
 
 
 // ── Live match cache + source health tracking ─────────────────────────────────
