@@ -394,7 +394,6 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
             '122709': 'Eden Park, Auckland',
             '122720': 'Sky Stadium, Wellington',
             '122731': 'Hagley Oval, Christchurch',
-            '122858': 'Bay Oval, Mount Maunganui',
             '122808': 'Eden Park, Auckland',
             '122819': 'Sky Stadium, Wellington',
             '122825': 'Hagley Oval, Christchurch',
@@ -823,7 +822,7 @@ const asyncHandler =
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 
-// ── /score endpoint (unchanged) ──────────────────────────
+// ── /score endpoint — uses Puppeteer for JS-rendered live data ───────────────
 app.get(
   "/score",
   asyncHandler(async (req: Request, res: Response) => {
@@ -833,54 +832,97 @@ app.get(
       return;
     }
     const url = `https://www.cricbuzz.com/live-cricket-scores/${id}`;
-    const html = await fetchHTML(url);
+
+    // Use Puppeteer — axios only gets static header HTML, not the JS-rendered scorecard
+    const html = await fetchHTMLWithBrowser(url);
     const $ = cheerio.load(html);
-    const result = parseCricketScore($);
+    const baseResult = parseCricketScore($);
+    const bodyText = $('body').text().replace(/\s+/g, ' ');
 
-    // FIX: Cricbuzz serves JS-rendered match pages — axios only gets the header/menu HTML.
-    // BUT the menu text contains live match status like "RSA vs NZ - Need 99 off 79b"
-    // or "RSA vs NZ - NZ 45/2 (8.3 Ov)". Parse this directly as it updates every ball.
+    // ── BATTERS ───────────────────────────────────────────────
+    const batters: any[] = [];
+    // Cricbuzz batter rows: .cb-min-bat-rw or table rows with player links
+    $('.cb-min-bat-rw').each((_i: number, el: any) => {
+      const cols = $(el).find('td');
+      if (cols.length < 5) return;
+      const nameEl = $(cols[0]).find('a').first();
+      const name = nameEl.text().trim() || $(cols[0]).text().trim();
+      if (!name || name.length < 2) return;
+      const runs = parseInt($(cols[1]).text().trim()) || 0;
+      const balls = parseInt($(cols[2]).text().trim()) || 0;
+      const fours = parseInt($(cols[3]).text().trim()) || 0;
+      const sixes = parseInt($(cols[4]).text().trim()) || 0;
+      const sr = cols.length > 5 ? parseFloat($(cols[5]).text().trim()) || 0 : 0;
+      batters.push({ name, runs, balls, fours, sixes, sr: sr.toFixed(2) });
+    });
+
+    // ── BOWLERS ───────────────────────────────────────────────
+    const bowlers: any[] = [];
+    $('.cb-min-bowl-rw').each((_i: number, el: any) => {
+      const cols = $(el).find('td');
+      if (cols.length < 5) return;
+      const nameEl = $(cols[0]).find('a').first();
+      const name = nameEl.text().trim() || $(cols[0]).text().trim();
+      if (!name || name.length < 2) return;
+      const overs = $(cols[1]).text().trim();
+      const maidens = parseInt($(cols[2]).text().trim()) || 0;
+      const runs = parseInt($(cols[3]).text().trim()) || 0;
+      const wickets = parseInt($(cols[4]).text().trim()) || 0;
+      const economy = cols.length > 5 ? parseFloat($(cols[5]).text().trim()) || 0 : 0;
+      bowlers.push({ name, overs, maidens, runs, wickets, economy: economy.toFixed(2) });
+    });
+
+    // ── RECENT BALLS ─────────────────────────────────────────
+    let recentBalls: string[] = [];
+    const recentEl = $('.cb-col-100.cb-col.ng-binding').filter((_i: number, el: any) => {
+      return /^[0-9W\.\,\s]+$/.test($(el).text().trim());
+    }).first().text().trim();
+    if (recentEl) recentBalls = recentEl.split(/[\s,]+/).filter((b: string) => b.length > 0).slice(-12);
+
+    // ── PARTNERSHIP ──────────────────────────────────────────
+    let partnership = '';
+    $('*').each((_i: number, el: any) => {
+      if (partnership) return false as any;
+      const txt = $(el).text().trim();
+      if (/partnership/i.test(txt) && txt.length < 80 && $(el).children().length < 3) {
+        partnership = txt.replace(/\s+/g, ' ').trim();
+      }
+    });
+
+    // ── TOSS ─────────────────────────────────────────────────
+    let toss = '';
+    $('*').each((_i: number, el: any) => {
+      if (toss) return false as any;
+      const txt = $(el).text().trim();
+      if (/won the toss|opt(ed)? to/i.test(txt) && txt.length < 120 && $(el).children().length < 3) {
+        toss = txt.replace(/\s+/g, ' ').trim();
+      }
+    });
+
+    const result = {
+      ...baseResult,
+      batters,
+      bowlers,
+      recentBalls,
+      partnership,
+      toss: toss || baseResult.toss || '',
+    };
+
     if (!result.livescore || result.livescore === 'Match Stats will Update Soon') {
-      const bodyText = $('body').text().replace(/\s+/g, ' ');
-
-      // Extract the status text for this specific match from the MATCHES menu
-      // Pattern: "RSA vs NZ - <status>" or "NZW vs RSAW - <status>" in the nav text
-      const matchMenuPattern = /(?:RSA\s+vs\s+NZ|NZ\s+vs\s+RSA|New Zealand\s+vs\s+South Africa|South Africa\s+vs\s+New Zealand|NZW\s+vs\s+RSAW|RSAW\s+vs\s+NZW|New Zealand Women\s+vs\s+South Africa Women|South Africa Women\s+vs\s+New Zealand Women)\s*[-–]\s*([^R\|]+?)(?=RSA|NZW|AUS|IND|BOR|KNG|ALL|$)/i;
+      // Menu text fallback for status
+      const matchMenuPattern = /(?:RSA\s+vs\s+NZ|NZ\s+vs\s+RSA|New Zealand\s+vs\s+South Africa|South Africa\s+vs\s+New Zealand|NZW\s+vs\s+RSAW|RSAW\s+vs\s+NZW|New Zealand Women\s+vs\s+South Africa Women|South Africa Women\s+vs\s+New Zealand Women)\s*[-–]\s*([^\|<"]{3,60})/i;
       const menuMatch = bodyText.match(matchMenuPattern);
       if (menuMatch) {
-        const statusText = menuMatch[1].trim();
-        result.update = statusText;
-
-        // Parse "Need X off Yb" → derive score
-        const needMatch = statusText.match(/Need\s+(\d+)\s+(?:runs?\s+)?off\s+(\d+)\s*b/i);
-        if (needMatch) {
-          const runsNeeded = parseInt(needMatch[1]);
-          const ballsLeft = parseInt(needMatch[2]);
-          const oversLeft = (ballsLeft / 6).toFixed(1);
-          // We know: NZ batting 2nd, needs runsNeeded off ballsLeft
-          // Derive NZ score from target (target = RSA score + 1, but we don't have RSA score)
-          // Use status as livescore text directly — better than nothing
-          result.livescore = statusText;
-          result.update = `NZ need ${runsNeeded} off ${ballsLeft} balls (${oversLeft} ov)`;
-          console.log(`[score] id=${id} parsed from menu: "${statusText}"`);
-        } else {
-          // Other patterns: "45/2 (8.3 Ov)" or "NZ 45/2" etc.
-          const scoreInMenu = statusText.match(/(\d+)\/(\d+)\s*\(([0-9.]+)\s*[Oo]v/);
-          if (scoreInMenu) {
-            result.livescore = statusText;
-            console.log(`[score] id=${id} score from menu: "${statusText}"`);
-          } else {
-            result.livescore = statusText;
-            result.update = statusText;
-            console.log(`[score] id=${id} status from menu: "${statusText}"`);
-          }
-        }
+        result.update = menuMatch[1].trim();
+        result.livescore = menuMatch[1].trim();
+        console.log(`[score] id=${id} menu fallback: "${result.update}"`);
       } else {
-        console.log(`[score] id=${id} livescore empty. Page snippet: ${bodyText.substring(0, 300)}`);
+        console.log(`[score] id=${id} livescore empty — batters:${batters.length} bowlers:${bowlers.length}`);
       }
     } else {
-      console.log(`[score] id=${id} livescore="${result.livescore}" update="${result.update}"`);
+      console.log(`[score] id=${id} livescore="${result.livescore}" batters:${batters.length} bowlers:${bowlers.length}`);
     }
+
     res.json(result);
   })
 );
