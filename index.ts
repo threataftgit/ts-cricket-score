@@ -35,22 +35,19 @@ const fetchHTML = async (url: string): Promise<string> => {
 
 // ── Shared browser — singleton, reused across requests ──
 let sharedBrowser: any = null;
-const activePages = new Set<any>(); // FIX: track open pages to avoid leaks
+const activePages = new Set<any>();
 
 async function getSharedBrowser() {
   if (!sharedBrowser) {
     const fs = require('fs');
     const { execSync } = require('child_process');
 
-    // Find real Chromium — skip snap stubs which fail in Railway containers
+    // Find real Chromium — skip snap stubs
     const executablePath: string | undefined = process.env.PUPPETEER_EXECUTABLE_PATH || (() => {
-      // 1. Try `which chromium` — skip snap wrappers
       try {
         const w = execSync('which chromium', { timeout: 3000 }).toString().trim();
         if (w && !w.includes('snap') && fs.existsSync(w)) return w;
       } catch {}
-
-      // 2. Search Nix store for real chromium binary
       try {
         const found = execSync(
           'find /nix/store -name "chromium" -type f 2>/dev/null | grep "/bin/chromium$" | head -1',
@@ -58,8 +55,6 @@ async function getSharedBrowser() {
         ).toString().trim();
         if (found && fs.existsSync(found)) return found;
       } catch {}
-
-      // 3. Common Nix profile paths
       const candidates = [
         '/nix/var/nix/profiles/default/bin/chromium',
         '/root/.nix-profile/bin/chromium',
@@ -68,7 +63,6 @@ async function getSharedBrowser() {
       for (const p of candidates) {
         try { if (fs.existsSync(p)) return p; } catch {}
       }
-
       return undefined;
     })();
 
@@ -77,6 +71,7 @@ async function getSharedBrowser() {
     sharedBrowser = await puppeteer.launch({
       headless: true,
       executablePath,
+      protocolTimeout: 60000,  // 👈 critical to avoid CDP timeouts
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -84,7 +79,7 @@ async function getSharedBrowser() {
         '--disable-gpu',
         '--no-first-run',
         '--no-zygote',
-        '--single-process',
+        // '--single-process',   // removed for stability
         '--disable-extensions',
         '--disable-background-networking',
         '--disable-default-apps',
@@ -101,8 +96,42 @@ async function getSharedBrowser() {
   return sharedBrowser;
 }
 
-// ── Puppeteer fetch — reuses browser, closes only the page ─
-// With retry logic and better waiting
+// ── Fast HTTP fallback for static pages ───────────────────
+async function fetchHTMLFast(url: string): Promise<string | null> {
+  try {
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+      },
+      timeout: 15000,
+    });
+    if (response.data.includes('cb-scrd-itms') || response.data.includes('cb-min-bat-rw')) {
+      return response.data;
+    }
+    return null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// ── Retry wrapper ─────────────────────────────────────────
+async function fetchWithRetry(fn: () => Promise<string>, maxRetries = 2, initialDelay = 1000): Promise<string> {
+  let lastError: Error | undefined;
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      if (i === maxRetries) break;
+      const delay = initialDelay * Math.pow(2, i);
+      console.warn(`Retry ${i+1}/${maxRetries} after ${delay}ms: ${err.message}`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw lastError || new Error('All retries failed');
+}
+
+// ── Puppeteer fetch with better waiting ───────────────────
 async function fetchHTMLWithBrowser(url: string): Promise<string> {
   const browser = await getSharedBrowser();
   const page = await browser.newPage();
@@ -119,12 +148,8 @@ async function fetchHTMLWithBrowser(url: string): Promise<string> {
         req.continue();
       }
     });
-
-    // Increase timeout to 60 seconds and use networkidle2
     const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     console.log(`[browser] ${url} -> status ${response?.status()}, content length ${(await page.content()).length}`);
-
-    // Wait for a known scorecard element (adjust if needed)
     try {
       await page.waitForSelector(
         '.cb-scrd-itms, .cb-min-bat-rw, table[class*="scorecard"], .cb-ltst-wgt-hdr',
@@ -133,7 +158,6 @@ async function fetchHTMLWithBrowser(url: string): Promise<string> {
     } catch (selectorError) {
       console.warn(`[browser] Scorecard selectors not found for ${url}`);
     }
-
     return await page.content();
   } finally {
     activePages.delete(page);
@@ -141,56 +165,12 @@ async function fetchHTMLWithBrowser(url: string): Promise<string> {
   }
 }
 
-// ── Fast HTTP fallback for static pages ───────────────────
-async function fetchHTMLFast(url: string): Promise<string | null> {
-  try {
-    const response = await axios.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
-      },
-      timeout: 15000,
-    });
-    // If the HTML contains a scorecard table, it's good.
-    if (response.data.includes('cb-scrd-itms') || response.data.includes('cb-min-bat-rw')) {
-      console.log(`[fast] Success for ${url} (size ${response.data.length})`);
-      return response.data;
-    }
-    console.log(`[fast] No scorecard markers in ${url}, falling back to Puppeteer`);
-    return null;
-  } catch (err: any) {
-    console.warn(`[fast] Failed for ${url}: ${err.message}`);
-    return null;
-  }
-}
-
-// ── Retry wrapper with exponential backoff ─────────────────
-async function fetchWithRetry(
-  fn: () => Promise<string>,
-  maxRetries = 2,
-  initialDelay = 1000
-): Promise<string> {
-  let lastError: Error | undefined;
-  for (let i = 0; i <= maxRetries; i++) {
-    try {
-      return await fn();
-    } catch (err: any) {
-      lastError = err;
-      if (i === maxRetries) break;
-      const delay = initialDelay * Math.pow(2, i);
-      console.warn(`Retry ${i+1}/${maxRetries} after ${delay}ms: ${err.message}`);
-      await new Promise(r => setTimeout(r, delay));
-    }
-  }
-  throw lastError || new Error('All retries failed');
-}
-
 // ── Helper: detect match type from slug/text ─────────────
 function detectMatchType(slug: string, cardText: string): string {
-  // FIX: was always hardcoded 'T20'
   if (/\btest\b/i.test(slug) || /\btest match\b/i.test(cardText)) return 'Test';
   if (/\bodi\b/i.test(slug) || /\bone.?day/i.test(cardText)) return 'ODI';
   if (/\bt20i?\b/i.test(slug) || /\bt20\b/i.test(cardText)) return 'T20';
-  return 'T20'; // sensible fallback
+  return 'T20';
 }
 
 // ── Fetch live matches ───────────────────────────────────
@@ -224,13 +204,11 @@ const fetchLiveMatches = async (): Promise<any[]> => {
     const cardText = card.text().replace(/\s+/g, ' ').trim().substring(0, 500);
     const isLive = /live|batting|bowling|(?:[0-9]+\/[0-9]+)|yet to bat|in progress/i.test(cardText);
 
-    // Get text from leaf nodes only
     const textOnly = card.find('*').map((_: number, el: any) => {
       if ($(el).children().length === 0) return $(el).text().trim();
       return '';
     }).get().join(' ');
 
-    // FIX: also extract overs from card text
     const scorePattern = /([0-9]{1,3})\/([0-9]{1,2})/g;
     const scores: any[] = [];
     let sm: RegExpExecArray | null;
@@ -239,24 +217,21 @@ const fetchLiveMatches = async (): Promise<any[]> => {
       const runs = parseInt(sm[1]);
       const wkts = parseInt(sm[2]);
       if (runs <= 500 && wkts <= 10) {
-        // FIX: extract overs from surrounding text around this score
         const surroundingText = textOnly.substring(Math.max(0, sm.index - 30), sm.index + 30);
         const oversMatch = surroundingText.match(/([0-9]+\.?[0-9]*)\s*(?:ov(?:ers?)?|Ov)/i)
           || textOnly.match(/([0-9]+\.?[0-9]*)\s*(?:ov(?:ers?)?|Ov)/i);
         scores.push({
           r: runs,
           w: wkts,
-          o: oversMatch ? oversMatch[1] : '0.0', // FIX: real overs instead of hardcoded '0.0'
+          o: oversMatch ? oversMatch[1] : '0.0',
           inning: scores.length === 0 ? '1st' : '2nd',
         });
         if (scores.length >= 2) break;
       }
     }
 
-    // FIX: hasScore must be declared AFTER scores is built (moved from above to fix TS2448)
     const hasScore = scores.length > 0;
 
-    // Venue extraction
     let venue = '';
     card.find('span, p').each((_: number, el: any) => {
       if (venue || $(el).children().length > 0) return;
@@ -269,13 +244,10 @@ const fetchLiveMatches = async (): Promise<any[]> => {
       }
     });
 
-    // FIX: detect which team is batting from card text
-    let battingTeamIdx = 0; // default: first team is batting
+    let battingTeamIdx = 0;
     if (scores.length >= 2) {
-      // 2 innings present — second innings is current batting team
       battingTeamIdx = 1;
     } else if (/\b(batting|bat)\b/i.test(cardText)) {
-      // Check which team name appears before "batting"
       const battingPos = cardText.search(/\bbatting\b/i);
       const t1Pos = team1 ? cardText.toUpperCase().indexOf(team1) : -1;
       const t2Pos = team2 ? cardText.toUpperCase().indexOf(team2) : -1;
@@ -284,7 +256,6 @@ const fetchLiveMatches = async (): Promise<any[]> => {
       }
     }
 
-    // FIX: detect match type properly
     const matchType = detectMatchType(slug, cardText);
 
     matches.push({
@@ -297,7 +268,7 @@ const fetchLiveMatches = async (): Promise<any[]> => {
       venue,
       score: scores,
       matchType,
-      battingTeamIdx, // FIX: export which index is batting (0 or 1)
+      battingTeamIdx,
     });
   });
 
@@ -307,7 +278,7 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 
 // ── Series cache ─────────────────────────────────────────
 const seriesCache: Record<string, { data: any[]; ts: number }> = {};
-const SERIES_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const SERIES_CACHE_TTL = 10 * 60 * 1000;
 const seriesInProgress: Record<string, Promise<any[]> | null> = {};
 
 const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
@@ -351,7 +322,7 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
     console.log(`[series] Found ${matchLinks.length} match links`);
     const matches: any[] = [];
 
-    // Reduced concurrency from 3 to 1 to avoid overwhelming the site
+    // Reduced concurrency to 1 to avoid overwhelming the site
     const CONCURRENCY = 1;
     for (let i = 0; i < matchLinks.length; i += CONCURRENCY) {
       const batch = matchLinks.slice(i, i + CONCURRENCY);
@@ -429,7 +400,6 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
             || '';
 
           if (!venue) {
-            // FIX: broader venue regex to work for IPL and other venues
             const venueMatch = fullPageText.match(
               /(?:at|venue[:\s]+|ground[:\s]+)([A-Z][a-zA-Z ]{4,50})(?:Stadium|Ground|Oval|Park|Arena|Gardens?)/i
             );
@@ -439,7 +409,7 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
             }
           }
 
-          // Known venue fallback (extended with IPL venues)
+          // Known venue fallback
           const knownVenues: Record<string, string> = {
             '122687': 'Bay Oval, Mount Maunganui',
             '122698': 'Seddon Park, Hamilton',
@@ -470,7 +440,6 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
         }
       }
 
-      // Add delay between batches to avoid rate limiting
       if (i + CONCURRENCY < matchLinks.length) {
         await new Promise(r => setTimeout(r, 1500));
       }
@@ -486,12 +455,11 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
   return fetchPromise;
 };
 
-// ── Fetch scorecard ───────────────────────────────────────
-// ── Scorecard cache ───────────────────────────────────────────────────────────
+// ── Scorecard cache ───────────────────────────────────────
 const scorecardCache: Record<string, { data: any; ts: number }> = {};
 const SCORECARD_TTL = 10 * 60 * 1000;
 
-// ── CricAPI scorecard — clean JSON, no scraping, works for all IPL matches ───
+// ── CricAPI scorecard — clean JSON, works for all matches ───
 async function fetchScorecardFromAPI(matchId: string): Promise<any | null> {
   const apiKey = process.env.CRICKET_API_KEY;
   if (!apiKey) return null;
@@ -527,15 +495,13 @@ async function fetchScorecardFromAPI(matchId: string): Promise<any | null> {
   }
 }
 
-// Known slugs for completed matches — avoids depending on series cache
+// Known slugs for completed matches
 const KNOWN_SLUGS: Record<string, string> = {
-  // Men's NZ vs SA
   '122687': 'new-zealand-vs-south-africa-1st-t20i',
   '122698': 'new-zealand-vs-south-africa-2nd-t20i',
   '122709': 'new-zealand-vs-south-africa-3rd-t20i',
   '122720': 'new-zealand-vs-south-africa-4th-t20i',
   '122731': 'new-zealand-vs-south-africa-5th-t20i',
-  // Women's NZ vs SA
   '122783': 'new-zealand-women-vs-south-africa-women-1st-t20i',
   '122797': 'new-zealand-women-vs-south-africa-women-2nd-t20i',
   '122836': 'new-zealand-women-vs-south-africa-women-3rd-t20i',
@@ -544,14 +510,14 @@ const KNOWN_SLUGS: Record<string, string> = {
 };
 
 const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
-  // Check cache first
+  // Check cache
   const cached = scorecardCache[matchId];
   if (cached && Date.now() - cached.ts < SCORECARD_TTL) {
     console.log(`[scorecard] Cache hit: ${matchId}`);
     return cached.data;
   }
 
-  // Try CricAPI first — works for ALL matches including IPL, no scraping
+  // Try CricAPI first
   const apiResult = await fetchScorecardFromAPI(matchId);
   if (apiResult && apiResult.innings?.length > 0) {
     scorecardCache[matchId] = { data: apiResult, ts: Date.now() };
@@ -559,8 +525,7 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
     return apiResult;
   }
 
-  // Fallback: Puppeteer scraper (only for NZ vs SA with known slugs)
-  // Priority: explicit slug → known slugs map → series cache → generic fallback
+  // Fallback: Puppeteer
   let matchSlug = slug
     || KNOWN_SLUGS[matchId]
     || (() => {
@@ -572,7 +537,6 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
       })()
     || 'cricket-scorecard';
 
-  // Try scorecard URL, then live-scores URL as fallback
   const urlsToTry = [
     `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}/${matchSlug}`,
     `https://www.cricbuzz.com/live-cricket-scores/${matchId}/${matchSlug}`,
@@ -583,14 +547,12 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
   for (const tryUrl of urlsToTry) {
     try {
       console.log(`[scorecard] Fetching: ${tryUrl}`);
-      // Try fast HTTP first
       let fastHtml = await fetchHTMLFast(tryUrl);
       if (fastHtml) {
         html = fastHtml;
         usedUrl = tryUrl;
         break;
       }
-      // Fallback to Puppeteer with retry
       html = await fetchWithRetry(() => fetchHTMLWithBrowser(tryUrl));
       if (html.length > 10000) { usedUrl = tryUrl; break; }
     } catch(e: any) {
@@ -619,7 +581,6 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
     || $(".cb-col.cb-col-100.cb-font-12.cb-text-gray").first().text().trim()
     || '';
   if (!result) {
-    // Scan all elements for result text
     $('*').each((_i: number, el: any) => {
       if (result) return false as any;
       if ($(el).children().length > 2) return;
@@ -633,10 +594,7 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
 
   const innings: any[] = [];
 
-  // ══════════════════════════════════════════════════════════
   // STRATEGY 1 — Old Cricbuzz class-based selectors
-  // Works on pages that haven't migrated to new Tailwind UI
-  // ══════════════════════════════════════════════════════════
   const innContainers = $(".cb-col.cb-col-100.cb-ltst-wgt-hdr");
   innContainers.each((i: number, innEl: any) => {
     const innTitle = $(innEl).find(".cb-col.cb-col-100.cb-bg-gray").text().trim()
@@ -675,16 +633,12 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
     }
   });
 
-  // ══════════════════════════════════════════════════════════
-  // STRATEGY 2 — New Cricbuzz Tailwind UI: table-based
-  // New UI uses <table> with <th> "Batter"/"Bowler" headers
-  // ══════════════════════════════════════════════════════════
+  // STRATEGY 2 — New Cricbuzz Tailwind UI tables
   if (innings.length === 0) {
     console.log(`[scorecard] Strategy 1 found 0 innings — trying Strategy 2 (tables)`);
 
     let currentInnings: { title: string; batting: any[]; bowling: any[] } | null = null;
 
-    // Detect inning boundary headers
     $('h2, h3, [class*="inning"], [class*="innings"], [class*="header"]').each((_i: number, el: any) => {
       const text = $(el).text().trim();
       if (/innings|1st inn|2nd inn|batting/i.test(text) && text.length < 150) {
@@ -695,7 +649,6 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
       }
     });
 
-    // Parse all tables
     $('table').each((_i: number, table: any) => {
       const headers = $(table).find('th').map((_j: number, th: any) =>
         $(th).text().trim().toLowerCase()
@@ -705,14 +658,12 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
         $(tr).find('td').length > 0
       );
 
-      // Batting table: "batter" or "batsman" in headers
       if (headers.some((h: string) => h.includes('batter') || h.includes('batsman'))) {
         const batData: any[] = [];
         rows.each((_j: number, row: any) => {
           const cells = $(row).find('td').map((_k: number, td: any) =>
             $(td).text().trim()
           ).get() as string[];
-          // cells: [name, dismissal, R, B, 4s, 6s, SR]
           if (cells.length >= 3 && cells[0] && /^\d+$/.test(cells[2] || '')) {
             batData.push({
               batsman:   cells[0].replace(/\s*\(c\)|\s*\†/g, '').trim(),
@@ -730,14 +681,12 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
         }
       }
 
-      // Bowling table: "bowler" in headers
       if (headers.some((h: string) => h.includes('bowler'))) {
         const bowlData: any[] = [];
         rows.each((_j: number, row: any) => {
           const cells = $(row).find('td').map((_k: number, td: any) =>
             $(td).text().trim()
           ).get() as string[];
-          // cells: [name, O, M, R, W, Econ]
           if (cells.length >= 4 && cells[0] && /^\d+\.?\d*$/.test(cells[1] || '')) {
             bowlData.push({
               bowler:  cells[0].replace(/\s*\(c\)/g, '').trim(),
@@ -761,10 +710,7 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
     }
   }
 
-  // ══════════════════════════════════════════════════════════
-  // STRATEGY 3 — Generic JSON-LD / script tag data
-  // Cricbuzz sometimes embeds match data in JSON-LD <script> tags
-  // ══════════════════════════════════════════════════════════
+  // STRATEGY 3 — JSON-LD fallback
   if (innings.length === 0) {
     console.log(`[scorecard] Strategy 2 found 0 innings — trying Strategy 3 (JSON-LD)`);
     $('script[type="application/ld+json"]').each((_i: number, el: any) => {
@@ -791,7 +737,6 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
     });
   }
 
-  // ── Final logging ─────────────────────────────────────────
   if (innings.length === 0) {
     console.warn(`[scorecard] All strategies failed for ${matchId}. URL: ${usedUrl}`);
     console.warn(`[scorecard] Page snippet: ${fullText.substring(0, 300)}`);
@@ -800,7 +745,6 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
   }
 
   const scraped = { matchName, venue, result, innings };
-  // Cache even partial results — better than hitting Cricbuzz every time
   scorecardCache[matchId] = { data: scraped, ts: Date.now() };
   return scraped;
 };
@@ -831,15 +775,13 @@ const parseCricketScore = ($: cheerio.CheerioAPI): Record<string, string> => {
   const matchDateElement = $('span[itemprop="startDate"]').attr("content");
   const matchDateUTC = matchDateElement ? new Date(matchDateElement).toISOString() : '';
 
-  // FIX: try multiple selectors for livescore — Cricbuzz changed their UI classes.
-  // Old UI: .cb-font-20.text-bold | New UI: various score display classes
   const livescoreSelectors = [
-    ".cb-font-20.text-bold",           // old Cricbuzz UI
-    ".cb-lv-scrs-well strong",         // live score well
-    ".cb-min-bat-rw .cb-lv-scrs",      // batting row score
-    "[class*='cb-scrs-wrp'] strong",   // score wrapper
-    ".cb-scrs-wrp .cb-font-20",        // score wrapper font
-    ".cb-min-inf .cb-font-20",         // match info score
+    ".cb-font-20.text-bold",
+    ".cb-lv-scrs-well strong",
+    ".cb-min-bat-rw .cb-lv-scrs",
+    "[class*='cb-scrs-wrp'] strong",
+    ".cb-scrs-wrp .cb-font-20",
+    ".cb-min-inf .cb-font-20",
   ];
 
   let livescore = '';
@@ -851,10 +793,8 @@ const parseCricketScore = ($: cheerio.CheerioAPI): Record<string, string> => {
     }
   }
 
-  // FIX: if still empty, try scraping score from body text using regex
   if (!livescore) {
     const bodyText = $('body').text().replace(/\s+/g, ' ');
-    // Look for patterns like "RSA 45/2 (8.3 Ov)" or "45/2 (8.3)"
     const scoreMatch = bodyText.match(/([A-Z]{2,4}\s+)?\d{1,3}\/\d{1,2}\s*\(\d{1,2}\.?\d*\s*[Oo]v/);
     if (scoreMatch) livescore = scoreMatch[0].trim();
   }
@@ -882,7 +822,7 @@ const asyncHandler =
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 
-// ── /score endpoint — intercepts Cricbuzz XHR for live score ─────────────────
+// ── /score endpoint (unchanged) ─────────────────────────────────
 app.get(
   "/score",
   asyncHandler(async (req: Request, res: Response) => {
@@ -903,7 +843,6 @@ app.get(
         r.continue();
       });
 
-      // Intercept Cricbuzz's internal score XHR calls
       page.on('response', async (response: any) => {
         const u = response.url();
         try {
@@ -987,7 +926,6 @@ app.get(
 
       const result: any = { ...baseResult, batters, bowlers, recentBalls, partnership, toss: toss || baseResult.toss || '' };
 
-      // Use intercepted XHR mini-score (most reliable)
       if (miniScore) {
         const ms = miniScore.miniscore || miniScore;
         const r = ms.batTeam?.teamScore ?? ms.runs;
@@ -999,14 +937,12 @@ app.get(
         }
       }
 
-      // Body text fallback — look for X/Y (Z Ov) pattern
       if (!result.livescore || result.livescore === 'Match Stats will Update Soon') {
         const bodyScore = bodyText.match(/\b(\d{1,3})\/(\d{1,2})\s*\((\d{1,2}\.?\d*)\s*[Oo]v/);
         if (bodyScore) {
           result.livescore = `${bodyScore[1]}/${bodyScore[2]} (${bodyScore[3]} Ov)`;
           console.log(`[score] id=${id} body: ${result.livescore}`);
         } else {
-          // Nav menu fallback
           const menuMatch = bodyText.match(/(?:NZ\s+vs\s+RSA|RSA\s+vs\s+NZ|New Zealand\s+vs\s+South Africa|South Africa\s+vs\s+New Zealand)\s*[-–]\s*([^\|<"]{3,60})/i);
           if (menuMatch) {
             result.update = menuMatch[1].trim();
@@ -1033,20 +969,17 @@ app.get(
 let liveMatchCache: any[] = [];
 let liveCacheTime  = 0;
 let lastLiveCount  = -1;
-// FIX: adaptive cache TTL — 30s during match hours (4am–11pm UTC), 90s otherwise
 function getLiveCacheTTL(): number {
   const h = new Date().getUTCHours();
   return (h >= 4 && h <= 17) ? 30 * 1000 : 90 * 1000;
 }
-const LIVE_CACHE_TTL = 30 * 1000; // used only for setInterval — adaptive TTL used in requests
+const LIVE_CACHE_TTL = 30 * 1000;
 
-// Track which data source is working
 const sourceHealth = {
   cricbuzz: { healthy: true,  failures: 0, lastOk: 0 },
   cricapi:  { healthy: false, failures: 0, lastOk: 0 },
 };
 
-// ── CricAPI live scores — backup when Cricbuzz is blocked ────────────────────
 async function fetchLiveMatchesCricAPI(): Promise<any[]> {
   const apiKey = process.env.CRICKET_API_KEY;
   if (!apiKey) return [];
@@ -1066,14 +999,12 @@ async function fetchLiveMatchesCricAPI(): Promise<any[]> {
     return json.data
       .filter((m: any) => m.matchStarted && !m.matchEnded)
       .map((m: any) => {
-        // Parse score into standard format
         const scores: any[] = (m.score || []).map((s: any, i: number) => ({
           r: parseInt(s.r) || 0,
           w: parseInt(s.w) || 0,
           o: parseFloat(s.o) || 0,
           inning: i === 0 ? '1st' : '2nd',
         }));
-
         const teams = m.teams || [];
         return {
           id:             m.id,
@@ -1095,7 +1026,6 @@ async function fetchLiveMatchesCricAPI(): Promise<any[]> {
   }
 }
 
-// ── RapidAPI live scores — second backup ─────────────────────────────────────
 async function fetchLiveMatchesRapidAPI(): Promise<any[]> {
   const apiKey = process.env.RAPIDAPI_KEY;
   if (!apiKey) return [];
@@ -1152,9 +1082,7 @@ async function fetchLiveMatchesRapidAPI(): Promise<any[]> {
   }
 }
 
-// ── Smart refresh — Cricbuzz primary, auto-fallback to APIs ──────────────────
 async function refreshLiveCache() {
-  // Try Cricbuzz first (primary — most detailed data)
   if (sourceHealth.cricbuzz.healthy || sourceHealth.cricbuzz.failures < 3) {
     try {
       const matches = await fetchLiveMatches();
@@ -1177,7 +1105,6 @@ async function refreshLiveCache() {
     }
   }
 
-  // Cricbuzz failed — try CricAPI
   console.log('[cache] Switching to CricAPI backup...');
   const cricapiMatches = await fetchLiveMatchesCricAPI();
   if (cricapiMatches.length > 0) {
@@ -1190,7 +1117,6 @@ async function refreshLiveCache() {
     return;
   }
 
-  // CricAPI also failed — try RapidAPI
   console.log('[cache] Switching to RapidAPI backup...');
   const rapidMatches = await fetchLiveMatchesRapidAPI();
   if (rapidMatches.length > 0) {
@@ -1201,11 +1127,9 @@ async function refreshLiveCache() {
     return;
   }
 
-  // All sources failed — keep stale cache
   console.error('[cache] ALL sources failed — keeping stale data');
 }
 
-// Retry Cricbuzz every 5 minutes even when it's marked unhealthy
 setInterval(() => {
   if (!sourceHealth.cricbuzz.healthy) {
     console.log('[cache] Retrying Cricbuzz...');
@@ -1222,10 +1146,7 @@ app.get(
   "/live",
   asyncHandler(async (req: Request, res: Response) => {
     const age = Date.now() - liveCacheTime;
-    // FIX: force refresh if cache is older than adaptive TTL (was always serving stale cache)
-    if (age > getLiveCacheTTL()) {
-      await refreshLiveCache();
-    }
+    if (age > getLiveCacheTTL()) await refreshLiveCache();
     const ageSeconds = Math.round((Date.now() - liveCacheTime) / 1000);
     res.json({
       matches:    liveMatchCache,
@@ -1278,7 +1199,7 @@ app.get(
   })
 );
 
-// ── /health endpoint (was missing entirely) ─────────
+// ── /health ───────────────────────────────────────────────
 app.get('/health', (req: Request, res: Response) => {
   res.json({
     status: 'ok',
@@ -1302,16 +1223,9 @@ app.get('/health', (req: Request, res: Response) => {
   });
 });
 
-// ── /prematch/:matchId — scrape squads, venue, head-to-head ──
-// Called by match-agent 90min before, and by match.html on load.
-// Scrapes Cricbuzz match page for:
-//  - Playing XIs (when confirmed)
-//  - Toss result (when available)
-//  - Venue info + pitch report
-//  - Head-to-head record
-//  - Umpires
+// ── /prematch/:matchId ───────────────────────────────────
 const prematchCache: Record<string, { data: any; ts: number }> = {};
-const PREMATCH_TTL = 5 * 60 * 1000; // 5 min cache
+const PREMATCH_TTL = 5 * 60 * 1000;
 
 app.get(
   '/prematch/:matchId',
@@ -1319,21 +1233,17 @@ app.get(
     const { matchId } = req.params;
     const slug = req.query.slug as string || '';
 
-    // Cache hit
     const cached = prematchCache[matchId];
     if (cached && Date.now() - cached.ts < PREMATCH_TTL) {
       res.json({ ...cached.data, cached: true });
       return;
     }
 
-    // Resolve slug from known slugs or query
     const KNOWN_SLUGS: Record<string, string> = {
-      // Men's NZ vs SA — remaining
-      '122720': 'new-zealand-vs-south-africa-4th-t20i',  // TODAY — 11:45 IST
+      '122720': 'new-zealand-vs-south-africa-4th-t20i',
       '122731': 'new-zealand-vs-south-africa-5th-t20i',
-      // Women's NZ vs SA — remaining
-      '122836': 'new-zealand-women-vs-south-africa-women-3rd-t20i', // FIX: was missing
-      '122847': 'new-zealand-women-vs-south-africa-women-4th-t20i', // TODAY — in progress
+      '122836': 'new-zealand-women-vs-south-africa-women-3rd-t20i',
+      '122847': 'new-zealand-women-vs-south-africa-women-4th-t20i',
       '122858': 'new-zealand-women-vs-south-africa-women-5th-t20i',
     };
     const matchSlug = slug || KNOWN_SLUGS[matchId] || 'cricket-match';
@@ -1344,19 +1254,15 @@ app.get(
       const html = await fetchHTMLWithBrowser(url);
       const $    = cheerio.load(html);
 
-      // ── Toss ──────────────────────────────────────────────
       let toss = $('.cb-toss-sts').first().text().trim()
         || $('.cb-text-inprogress').first().text().trim()
         || '';
-      // Clean up toss text
       if (toss && !/won toss/i.test(toss)) toss = '';
 
-      // ── Match status / result ─────────────────────────────
       const status = $('.cb-text-complete').first().text().trim()
         || $('.cb-min-stts').first().text().trim()
         || '';
 
-      // ── Venue ─────────────────────────────────────────────
       let venue = $('[itemprop="location"]').text().trim()
         || $('.cb-nav-subhdr span').last().text().trim()
         || '';
@@ -1366,12 +1272,9 @@ app.get(
         if (vm) venue = vm[1].trim();
       }
 
-      // ── Match date ────────────────────────────────────────
       const matchDateEl = $('span[itemprop="startDate"]').attr('content');
       const matchDate   = matchDateEl ? new Date(matchDateEl).toISOString() : '';
 
-      // ── Playing XIs ───────────────────────────────────────
-      // Cricbuzz shows XIs inside .cb-minfo-tm-nm / .cb-player-name divs
       const teams: any[] = [];
       $('.cb-minfo-tm-nm').each((_i: number, el: any) => {
         const teamName = $(el).find('.cb-font-16').first().text().trim()
@@ -1388,7 +1291,6 @@ app.get(
         }
       });
 
-      // Fallback: try alternate XI selectors
       if (teams.length === 0) {
         const xiBlocks = $('.cb-col-100.cb-col.cb-teams-ng-itm');
         xiBlocks.each((_i: number, block: any) => {
@@ -1404,7 +1306,6 @@ app.get(
         });
       }
 
-      // ── Umpires ───────────────────────────────────────────
       let umpires = '';
       $('*').each((_i: number, el: any) => {
         if (umpires) return false as any;
@@ -1414,8 +1315,6 @@ app.get(
         }
       });
 
-      // ── Head-to-head ──────────────────────────────────────
-      // Try to extract from page (Cricbuzz sometimes shows this)
       let h2h = '';
       $('*').each((_i: number, el: any) => {
         if (h2h) return false as any;
@@ -1425,7 +1324,6 @@ app.get(
         }
       });
 
-      // ── Pitch report ──────────────────────────────────────
       let pitch = '';
       $('*').each((_i: number, el: any) => {
         if (pitch) return false as any;
@@ -1436,7 +1334,6 @@ app.get(
         }
       });
 
-      // ── Win probability (simple, from CricAPI if key available) ──
       let winProb = { team1: 50, team2: 50 };
       const apiKey = process.env.CRICKET_API_KEY;
       if (apiKey) {
@@ -1459,7 +1356,7 @@ app.get(
         status,
         venue,
         matchDate,
-        teams,          // [{ name, players[] }]
+        teams,
         umpires,
         h2h,
         pitch,
@@ -1494,23 +1391,18 @@ app.get(
   })
 );
 
-// ── /schedule — auto-fetches results + upcoming from Cricbuzz ─────────────────
-// Returns structured match data for the active international series
-// Called by sportvibe-live server every 5 minutes — no manual updates needed
-
+// ── /schedule ─────────────────────────────────────────────
 let scheduleData: any = null;
 let scheduleTime = 0;
-const SCHEDULE_TTL = 5 * 60 * 1000; // 5 min cache
+const SCHEDULE_TTL = 5 * 60 * 1000;
 
 async function buildSchedule(): Promise<any> {
-  // Fetch current international schedules from Cricbuzz
   const url = 'https://www.cricbuzz.com/cricket-schedule/upcoming-series/international';
   const html = await fetchHTMLWithBrowser(url);
   const $ = cheerio.load(html);
 
   const series: any[] = [];
 
-  // Parse each schedule item
   $('.cb-col-100.cb-col.cb-ltst-wgt-hdr').each((_i: number, el: any) => {
     const seriesName = $(el).find('a').first().text().trim();
     if (!seriesName) return;
