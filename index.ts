@@ -102,10 +102,11 @@ async function getSharedBrowser() {
 }
 
 // ── Puppeteer fetch — reuses browser, closes only the page ─
-const fetchHTMLWithBrowser = async (url: string): Promise<string> => {
+// With retry logic and better waiting
+async function fetchHTMLWithBrowser(url: string): Promise<string> {
   const browser = await getSharedBrowser();
   const page = await browser.newPage();
-  activePages.add(page); // FIX: track page
+  activePages.add(page);
   try {
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
@@ -118,26 +119,70 @@ const fetchHTMLWithBrowser = async (url: string): Promise<string> => {
         req.continue();
       }
     });
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-    // FIX: wait for either old cb-* selectors OR new table-based UI
+    // Increase timeout to 60 seconds and use networkidle2
+    const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+    console.log(`[browser] ${url} -> status ${response?.status()}, content length ${(await page.content()).length}`);
+
+    // Wait for a known scorecard element (adjust if needed)
     try {
       await page.waitForSelector(
-        '.cb-min-stts, .cb-text-complete, .cb-text-inprogress, ' +
-        'a[href*="/live-cricket-scores/"], .cb-scrd-itms, ' +
-        'table th, [class*="scorecard"], [class*="innings"]',
-        { timeout: 6000 }
+        '.cb-scrd-itms, .cb-min-bat-rw, table[class*="scorecard"], .cb-ltst-wgt-hdr',
+        { timeout: 10000 }
       );
-    } catch {
-      // selector didn't appear — proceed with whatever loaded
+    } catch (selectorError) {
+      console.warn(`[browser] Scorecard selectors not found for ${url}`);
     }
 
     return await page.content();
   } finally {
-    activePages.delete(page); // FIX: untrack before closing
+    activePages.delete(page);
     await page.close();
   }
-};
+}
+
+// ── Fast HTTP fallback for static pages ───────────────────
+async function fetchHTMLFast(url: string): Promise<string | null> {
+  try {
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+      },
+      timeout: 15000,
+    });
+    // If the HTML contains a scorecard table, it's good.
+    if (response.data.includes('cb-scrd-itms') || response.data.includes('cb-min-bat-rw')) {
+      console.log(`[fast] Success for ${url} (size ${response.data.length})`);
+      return response.data;
+    }
+    console.log(`[fast] No scorecard markers in ${url}, falling back to Puppeteer`);
+    return null;
+  } catch (err: any) {
+    console.warn(`[fast] Failed for ${url}: ${err.message}`);
+    return null;
+  }
+}
+
+// ── Retry wrapper with exponential backoff ─────────────────
+async function fetchWithRetry(
+  fn: () => Promise<string>,
+  maxRetries = 2,
+  initialDelay = 1000
+): Promise<string> {
+  let lastError: Error | undefined;
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      if (i === maxRetries) break;
+      const delay = initialDelay * Math.pow(2, i);
+      console.warn(`Retry ${i+1}/${maxRetries} after ${delay}ms: ${err.message}`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw lastError || new Error('All retries failed');
+}
 
 // ── Helper: detect match type from slug/text ─────────────
 function detectMatchType(slug: string, cardText: string): string {
@@ -306,8 +351,8 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
     console.log(`[series] Found ${matchLinks.length} match links`);
     const matches: any[] = [];
 
-    // FIX: process in parallel batches of 3 instead of sequential (was N × Puppeteer pages in series)
-    const CONCURRENCY = 3;
+    // Reduced concurrency from 3 to 1 to avoid overwhelming the site
+    const CONCURRENCY = 1;
     for (let i = 0; i < matchLinks.length; i += CONCURRENCY) {
       const batch = matchLinks.slice(i, i + CONCURRENCY);
 
@@ -339,9 +384,16 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
           let result = '';
           let venue = '';
 
-          const scoreHtml = await fetchHTMLWithBrowser(
+          // Try fast HTTP first, then Puppeteer with retry
+          let scoreHtml: string | null = await fetchHTMLFast(
             `https://www.cricbuzz.com/live-cricket-scores/${matchId}/${slug}`
           );
+          if (!scoreHtml) {
+            scoreHtml = await fetchWithRetry(() =>
+              fetchHTMLWithBrowser(`https://www.cricbuzz.com/live-cricket-scores/${matchId}/${slug}`)
+            );
+          }
+
           const s$ = cheerio.load(scoreHtml);
 
           result = s$('.cb-text-complete').first().text().trim()
@@ -418,9 +470,9 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
         }
       }
 
-      // FIX: small delay between batches to avoid Cricbuzz rate limiting
+      // Add delay between batches to avoid rate limiting
       if (i + CONCURRENCY < matchLinks.length) {
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 1500));
       }
     }
 
@@ -531,7 +583,15 @@ const fetchScorecard = async (matchId: string, slug?: string): Promise<any> => {
   for (const tryUrl of urlsToTry) {
     try {
       console.log(`[scorecard] Fetching: ${tryUrl}`);
-      html = await fetchHTMLWithBrowser(tryUrl);
+      // Try fast HTTP first
+      let fastHtml = await fetchHTMLFast(tryUrl);
+      if (fastHtml) {
+        html = fastHtml;
+        usedUrl = tryUrl;
+        break;
+      }
+      // Fallback to Puppeteer with retry
+      html = await fetchWithRetry(() => fetchHTMLWithBrowser(tryUrl));
       if (html.length > 10000) { usedUrl = tryUrl; break; }
     } catch(e: any) {
       console.warn(`[scorecard] Fetch failed ${tryUrl}: ${e.message}`);
@@ -968,8 +1028,6 @@ app.get(
     }
   })
 );
-
-
 
 // ── Live match cache + source health tracking ─────────────────────────────────
 let liveMatchCache: any[] = [];
