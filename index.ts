@@ -394,6 +394,7 @@ const fetchSeriesMatches = async (seriesId: string): Promise<any[]> => {
             '122709': 'Eden Park, Auckland',
             '122720': 'Sky Stadium, Wellington',
             '122731': 'Hagley Oval, Christchurch',
+            '122858': 'Bay Oval, Mount Maunganui',
             '122808': 'Eden Park, Auckland',
             '122819': 'Sky Stadium, Wellington',
             '122825': 'Hagley Oval, Christchurch',
@@ -843,8 +844,8 @@ app.get(
       const bodyText = $('body').text().replace(/\s+/g, ' ');
 
       // Extract the status text for this specific match from the MATCHES menu
-      // Pattern: "RSA vs NZ - <status>" in the nav text
-      const matchMenuPattern = /(?:RSA\s+vs\s+NZ|NZ\s+vs\s+RSA|New Zealand\s+vs\s+South Africa|South Africa\s+vs\s+New Zealand)\s*[-–]\s*([^R\|]+?)(?=RSA|NZW|AUS|IND|BOR|KNG|ALL|$)/i;
+      // Pattern: "RSA vs NZ - <status>" or "NZW vs RSAW - <status>" in the nav text
+      const matchMenuPattern = /(?:RSA\s+vs\s+NZ|NZ\s+vs\s+RSA|New Zealand\s+vs\s+South Africa|South Africa\s+vs\s+New Zealand|NZW\s+vs\s+RSAW|RSAW\s+vs\s+NZW|New Zealand Women\s+vs\s+South Africa Women|South Africa Women\s+vs\s+New Zealand Women)\s*[-–]\s*([^R\|]+?)(?=RSA|NZW|AUS|IND|BOR|KNG|ALL|$)/i;
       const menuMatch = bodyText.match(matchMenuPattern);
       if (menuMatch) {
         const statusText = menuMatch[1].trim();
