@@ -148,15 +148,18 @@ async function fetchHTMLWithBrowser(url: string): Promise<string> {
         req.continue();
       }
     });
-    const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     console.log(`[browser] ${url} -> status ${response?.status()}, content length ${(await page.content()).length}`);
+    // Brief wait for JS to render score elements
+    await new Promise(r => setTimeout(r, 1500));
+    // Try to wait for score selector but don't fail if missing (Cricbuzz changed HTML)
     try {
       await page.waitForSelector(
-        '.cb-scrd-itms, .cb-min-bat-rw, table[class*="scorecard"], .cb-ltst-wgt-hdr',
-        { timeout: 10000 }
+        '.cb-scrd-itms, .cb-min-bat-rw, .cb-ltst-wgt-hdr, [class*="score"], [class*="bat"]',
+        { timeout: 5000 }
       );
     } catch (selectorError) {
-      console.warn(`[browser] Scorecard selectors not found for ${url}`);
+      // Selectors not found — page still usable, score may be in JSON response
     }
     return await page.content();
   } finally {
@@ -171,6 +174,109 @@ function detectMatchType(slug: string, cardText: string): string {
   if (/\bodi\b/i.test(slug) || /\bone.?day/i.test(cardText)) return 'ODI';
   if (/\bt20i?\b/i.test(slug) || /\bt20\b/i.test(cardText)) return 'T20';
   return 'T20';
+}
+
+
+// ── Cricbuzz internal JSON API — fast, no Puppeteer needed ─────────────
+// Cricbuzz uses these endpoints internally for their own frontend
+async function fetchCricbuzzMiniscore(matchId: string): Promise<any | null> {
+  const endpoints = [
+    `https://www.cricbuzz.com/api/cricket-match/${matchId}/full-commentary/1`,
+    `https://www.cricbuzz.com/api/cricket-match/${matchId}/commentary/1`,
+    `https://www.cricbuzz.com/api/cricket-match/${matchId}/live-score`,
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const res = await axios.get(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+          'Referer': `https://www.cricbuzz.com/live-cricket-scores/${matchId}/cricket-match`,
+          'Accept': 'application/json, text/plain, */*',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        timeout: 8000,
+      });
+      const data = res.data;
+      if (data && (data.miniscore || data.commentaryList)) {
+        const ms = data.miniscore;
+        if (!ms) return null;
+
+        const bt  = ms.batTeam?.teamScore;
+        const inn = ms.inningsId || 1;
+        if (!bt && !ms.runs) return null;
+
+        const runs    = bt?.runs ?? ms.runs ?? 0;
+        const wickets = bt?.wickets ?? ms.wickets ?? 0;
+        const overs   = ms.overs ?? 0;
+
+        // Batters
+        const batters: any[] = [];
+        if (ms.batsmanStriker) {
+          batters.push({
+            name: ms.batsmanStriker.batName,
+            runs: ms.batsmanStriker.runs ?? 0,
+            balls: ms.batsmanStriker.balls ?? 0,
+            fours: ms.batsmanStriker.fours ?? 0,
+            sixes: ms.batsmanStriker.sixes ?? 0,
+            isStriker: true,
+          });
+        }
+        if (ms.batsmanNonStriker) {
+          batters.push({
+            name: ms.batsmanNonStriker.batName,
+            runs: ms.batsmanNonStriker.runs ?? 0,
+            balls: ms.batsmanNonStriker.balls ?? 0,
+            fours: ms.batsmanNonStriker.fours ?? 0,
+            sixes: ms.batsmanNonStriker.sixes ?? 0,
+            isStriker: false,
+          });
+        }
+
+        // Bowler
+        const bowlers: any[] = [];
+        if (ms.bowlerStriker) {
+          bowlers.push({
+            name: ms.bowlerStriker.bowlName,
+            overs: ms.bowlerStriker.overs ?? '0',
+            maidens: ms.bowlerStriker.maidens ?? 0,
+            runs: ms.bowlerStriker.runs ?? 0,
+            wickets: ms.bowlerStriker.wickets ?? 0,
+          });
+        }
+
+        // Recent balls
+        const recentBalls: string[] = [];
+        if (data.commentaryList) {
+          for (const c of data.commentaryList.slice(0, 6)) {
+            if (c.ballNbr !== undefined) {
+              recentBalls.unshift(String(c.runs === 0 ? '.' : c.runs === -1 ? 'W' : c.runs));
+            }
+          }
+        }
+
+        const score = [{
+          r: runs, w: wickets, o: String(overs), inning: inn === 1 ? '1st' : '2nd'
+        }];
+
+        console.log(`[miniscore] ${matchId}: ${runs}/${wickets} (${overs}ov) batters:${batters.length}`);
+        return {
+          livescore: `${runs}/${wickets} (${overs} Ov)`,
+          score,
+          batters,
+          bowlers,
+          recentBalls,
+          status: ms.status || 'live',
+          toss: ms.toss || '',
+          innings: inn,
+          source: 'cricbuzz-json',
+        };
+      }
+    } catch (e: any) {
+      // try next endpoint
+    }
+  }
+  return null;
 }
 
 // ── Fetch live matches ───────────────────────────────────
@@ -273,6 +379,33 @@ const fetchLiveMatches = async (): Promise<any[]> => {
   });
 
   console.log(`[live] Found ${matches.length} matches`);
+
+  // Enrich IPL matches with live score from Cricbuzz JSON API
+  // This fixes the "scorecard selectors not found" issue — no selectors needed
+  const iplMatches = matches.filter((m: any) =>
+    m.isLive && (!m.score || m.score.length === 0 || (m.score[0]?.r === 0 && parseFloat(m.score[0]?.o || '0') === 0))
+  );
+
+  await Promise.allSettled(
+    iplMatches.slice(0, 3).map(async (m: any) => { // enrich top 3 live matches
+      const mini = await fetchCricbuzzMiniscore(m.id);
+      if (mini?.score?.length > 0) {
+        const idx = matches.findIndex((x: any) => x.id === m.id);
+        if (idx !== -1) {
+          matches[idx] = {
+            ...matches[idx],
+            score:    mini.score,
+            batters:  mini.batters || [],
+            bowlers:  mini.bowlers || [],
+            recentBalls: mini.recentBalls || [],
+            toss:     mini.toss || '',
+            status:   mini.status || 'live',
+          };
+        }
+      }
+    })
+  );
+
   return matches;
 };
 
@@ -497,6 +630,10 @@ async function fetchScorecardFromAPI(matchId: string): Promise<any | null> {
 
 // Known slugs for completed matches
 const KNOWN_SLUGS: Record<string, string> = {
+  // IPL 2026
+  '149618': 'royal-challengers-bengaluru-vs-sunrisers-hyderabad-1st-match',
+  '149629': 'mumbai-indians-vs-kolkata-knight-riders-2nd-match',
+  // NZ/SA completed
   '122687': 'new-zealand-vs-south-africa-1st-t20i',
   '122698': 'new-zealand-vs-south-africa-2nd-t20i',
   '122709': 'new-zealand-vs-south-africa-3rd-t20i',
@@ -822,13 +959,29 @@ const asyncHandler =
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 
-// ── /score endpoint (unchanged) ─────────────────────────────────
+// ── /score endpoint — fast JSON-first approach ─────────────────────────
 app.get(
   "/score",
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.query.id as string;
     if (!id) { res.status(400).json({ error: "Match ID is required" }); return; }
 
+    // FAST PATH: Try Cricbuzz internal JSON API first (no Puppeteer needed)
+    const miniResult = await fetchCricbuzzMiniscore(id);
+    if (miniResult && miniResult.score?.length > 0) {
+      const baseResult = {
+        title: `Match ${id}`,
+        update: miniResult.status || 'live',
+        matchDate: '',
+        matchDateFormatted: '',
+        livescore: miniResult.livescore,
+        runrate: '',
+      };
+      return res.json({ ...baseResult, ...miniResult });
+    }
+
+    // SLOW PATH: Puppeteer fallback (only if JSON API failed)
+    console.log(`[score] id=${id} — JSON API failed, using Puppeteer fallback`);
     const browser = await getSharedBrowser();
     const page = await browser.newPage();
     activePages.add(page);
@@ -864,8 +1017,9 @@ app.get(
       });
 
       const url = `https://www.cricbuzz.com/live-cricket-scores/${id}`;
-      await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
-      await new Promise(r => setTimeout(r, 3000));
+      // Use domcontentloaded instead of networkidle0 — much faster
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await new Promise(r => setTimeout(r, 2000));
 
       const html = await page.content();
       const $ = cheerio.load(html);
@@ -1086,15 +1240,40 @@ async function refreshLiveCache() {
   if (sourceHealth.cricbuzz.healthy || sourceHealth.cricbuzz.failures < 3) {
     try {
       const matches = await fetchLiveMatches();
-      if (matches.length > 0 || sourceHealth.cricbuzz.lastOk > Date.now() - 300_000) {
+      // Check if we have REAL scores — not just empty match list
+      const hasRealScores = matches.some((m: any) =>
+        m.score?.length > 0 && (m.score[0]?.r > 0 || parseFloat(String(m.score[0]?.o || 0)) > 0)
+      );
+      if (matches.length > 0) {
         liveMatchCache  = matches;
         liveCacheTime   = Date.now();
         sourceHealth.cricbuzz.healthy  = true;
         sourceHealth.cricbuzz.failures = 0;
         sourceHealth.cricbuzz.lastOk   = Date.now();
         if (matches.length !== lastLiveCount) {
-          console.log(`[cache] Cricbuzz: ${matches.length} live matches`);
+          console.log(`[cache] Cricbuzz: ${matches.length} live (hasScores:${hasRealScores})`);
           lastLiveCount = matches.length;
+        }
+        // Even if Cricbuzz list works, enrich with RapidAPI if scores are empty
+        if (!hasRealScores) {
+          console.log('[cache] Cricbuzz scores empty — enriching with RapidAPI...');
+          const rapidMatches = await fetchLiveMatchesRapidAPI();
+          if (rapidMatches.length > 0) {
+            // Merge: keep Cricbuzz match list but overlay RapidAPI scores
+            for (const rm of rapidMatches) {
+              const idx = liveMatchCache.findIndex((m: any) =>
+                m.teams?.some((t: string) => rm.teams?.some((rt: string) =>
+                  t.toLowerCase().includes(rt.toLowerCase().substring(0, 3))
+                ))
+              );
+              if (idx !== -1 && rm.score?.length > 0) {
+                liveMatchCache[idx] = { ...liveMatchCache[idx], score: rm.score, source: 'rapidapi-scores' };
+              } else if (idx === -1) {
+                liveMatchCache.push(rm); // add if not found by team matching
+              }
+            }
+            console.log(`[cache] RapidAPI enriched ${rapidMatches.length} match scores`);
+          }
         }
         return;
       }
@@ -1155,6 +1334,47 @@ app.get(
       count:      liveMatchCache.length,
       source:     liveMatchCache[0]?.source || 'cricbuzz',
     });
+  })
+);
+
+
+// ── /live/:matchId — fast score for a single match ──────────────────────
+app.get(
+  '/live/:matchId',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { matchId } = req.params;
+
+    // Try JSON API first — fastest
+    const mini = await fetchCricbuzzMiniscore(matchId);
+    if (mini?.score?.length > 0) {
+      return res.json({ success: true, matchId, ...mini });
+    }
+
+    // Try finding in live cache
+    const cached = liveMatchCache.find((m: any) => String(m.id) === String(matchId));
+    if (cached) {
+      return res.json({ success: true, matchId, ...cached });
+    }
+
+    // Try CricAPI if available
+    const cricKey = process.env.CRICKET_API_KEY;
+    if (cricKey) {
+      try {
+        const r = await fetch(
+          `https://api.cricapi.com/v1/cricScore?apikey=${cricKey}&id=${matchId}`,
+          { signal: AbortSignal.timeout(6000) }
+        );
+        const j = await r.json();
+        if (j.status === 'success' && j.data) {
+          const scores = (j.data.score || []).map((s: any, i: number) => ({
+            r: parseInt(s.r)||0, w: parseInt(s.w)||0, o: String(s.o||0), inning: i===0?'1st':'2nd'
+          }));
+          return res.json({ success: true, matchId, score: scores, status: j.data.status, source: 'cricapi' });
+        }
+      } catch(e) {}
+    }
+
+    res.status(404).json({ success: false, matchId, error: 'Score not available' });
   })
 );
 
@@ -1249,8 +1469,31 @@ app.get(
     const matchSlug = slug || KNOWN_SLUGS[matchId] || 'cricket-match';
 
     try {
+      // FAST PATH: Try Cricbuzz JSON API first for toss/venue
+      const jsonMini = await fetchCricbuzzMiniscore(matchId);
+      if (jsonMini?.toss && jsonMini.toss !== '') {
+        const result = {
+          matchId,
+          toss: jsonMini.toss,
+          status: jsonMini.status || '',
+          venue: 'M. Chinnaswamy Stadium, Bengaluru',
+          matchDate: '',
+          teams: [],
+          umpires: '',
+          h2h: '',
+          pitch: '',
+          winProb: { team1: 50, team2: 50 },
+          scrapedAt: new Date().toISOString(),
+          source: 'cricbuzz-json',
+        };
+        prematchCache[matchId] = { data: result, ts: Date.now() };
+        console.log(`[prematch] ${matchId}: toss="${jsonMini.toss}" via JSON API`);
+        return res.json(result);
+      }
+
+      // SLOW PATH: Puppeteer
       const url  = `https://www.cricbuzz.com/live-cricket-scores/${matchId}/${matchSlug}`;
-      console.log(`[prematch] Fetching: ${url}`);
+      console.log(`[prematch] Fetching via Puppeteer: ${url}`);
       const html = await fetchHTMLWithBrowser(url);
       const $    = cheerio.load(html);
 
