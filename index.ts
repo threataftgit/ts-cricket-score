@@ -279,6 +279,86 @@ async function fetchCricbuzzMiniscore(matchId: string): Promise<any | null> {
   return null;
 }
 
+
+// ── Extract score from Cricbuzz page HTML ────────────────────────────────
+// Cricbuzz moved to Next.js/React — scores are no longer in plain HTML selectors
+// But they ARE in: meta tags, title, __NEXT_DATA__ JSON blob, or script vars
+function extractScoreFromHTML(html: string): { score: any[], status: string } | null {
+  try {
+    // 1. Meta description — most reliable, always present
+    // Example: "RCB vs SRH Live Score - SRH 201/9 (20) | RCB 45/2 (5.4)"
+    const metaDesc = (html.match(/<meta[^>]+name="description"[^>]+content="([^"]{5,400})"/i) || 
+                      html.match(/<meta[^>]+content="([^"]{5,400})"[^>]+name="description"/i));
+    if (metaDesc) {
+      const desc = metaDesc[1];
+      const allScores = [];
+      const pat = /(\d{1,3})\/(\d{1,2})\s*\((\d{1,2}\.?\d*)/g;
+      let sm;
+      while ((sm = pat.exec(desc)) !== null && allScores.length < 2) {
+        allScores.push({ r: parseInt(sm[1]), w: parseInt(sm[2]), o: sm[3], inning: allScores.length === 0 ? '1st' : '2nd' });
+      }
+      if (allScores.length > 0) {
+        console.log(`[extract] Score from meta: ${JSON.stringify(allScores)}`);
+        return { score: allScores, status: 'live' };
+      }
+    }
+
+    // 2. Page title — "SRH 201/9 (20) vs RCB | IPL 2026 Live"
+    const titleM = html.match(/<title[^>]*>([^<]{5,300})<\/title>/i);
+    if (titleM) {
+      const allScores = [];
+      const pat = /(\d{1,3})\/(\d{1,2})\s*\((\d{1,2}\.?\d*)/g;
+      let sm;
+      while ((sm = pat.exec(titleM[1])) !== null && allScores.length < 2) {
+        allScores.push({ r: parseInt(sm[1]), w: parseInt(sm[2]), o: sm[3], inning: allScores.length === 0 ? '1st' : '2nd' });
+      }
+      if (allScores.length > 0) {
+        console.log(`[extract] Score from title: ${JSON.stringify(allScores)}`);
+        return { score: allScores, status: 'live' };
+      }
+    }
+
+    // 3. __NEXT_DATA__ JSON blob
+    const nextM = html.match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+    if (nextM) {
+      try {
+        const nd = JSON.parse(nextM[1]);
+        const flat = JSON.stringify(nd);
+        const allScores = [];
+        const pat = /"runs?"\s*:\s*(\d+)[^}]{0,100}"wickets?"\s*:\s*(\d+)[^}]{0,100}"overs?"\s*:\s*([\d.]+)/g;
+        let sm;
+        while ((sm = pat.exec(flat)) !== null && allScores.length < 2) {
+          const r = parseInt(sm[1]), w = parseInt(sm[2]), o = sm[3];
+          if (r > 0 || parseFloat(o) > 0) {
+            allScores.push({ r, w, o, inning: allScores.length === 0 ? '1st' : '2nd' });
+          }
+        }
+        if (allScores.length > 0) {
+          console.log(`[extract] Score from __NEXT_DATA__: ${JSON.stringify(allScores)}`);
+          return { score: allScores, status: 'live' };
+        }
+      } catch {}
+    }
+
+    // 4. Raw body text score pattern (team name + score)
+    const bodyText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+    const rawPat = /(?:RCB|SRH|MI|KKR|CSK|RR|DC|PBKS|GT|LSG)\s+(\d{1,3})\/(\d{1,2})\s*\((\d{1,2}\.?\d*)/gi;
+    const rawScores: any[] = [];
+    let rm;
+    while ((rm = rawPat.exec(bodyText)) !== null && rawScores.length < 2) {
+      rawScores.push({ r: parseInt(rm[1]), w: parseInt(rm[2]), o: rm[3], inning: rawScores.length === 0 ? '1st' : '2nd' });
+    }
+    if (rawScores.length > 0) {
+      console.log(`[extract] Score from body text: ${JSON.stringify(rawScores)}`);
+      return { score: rawScores, status: 'live' };
+    }
+
+    return null;
+  } catch(e) {
+    return null;
+  }
+}
+
 // ── Fetch live matches ───────────────────────────────────
 const fetchLiveMatches = async (): Promise<any[]> => {
   const url = "https://www.cricbuzz.com/cricket-match/live-scores";
@@ -388,6 +468,7 @@ const fetchLiveMatches = async (): Promise<any[]> => {
 
   await Promise.allSettled(
     iplMatches.slice(0, 3).map(async (m: any) => { // enrich top 3 live matches
+      // Try JSON API first
       const mini = await fetchCricbuzzMiniscore(m.id);
       if (mini?.score?.length > 0) {
         const idx = matches.findIndex((x: any) => x.id === m.id);
@@ -405,6 +486,31 @@ const fetchLiveMatches = async (): Promise<any[]> => {
       }
     })
   );
+
+  // Second pass: for any still-empty live matches, try direct page fetch + HTML extraction
+  const stillEmpty = matches.filter((m: any) =>
+    m.isLive && (!m.score || m.score.length === 0 ||
+      (m.score[0]?.r === 0 && m.score[0]?.w === 0 && parseFloat(String(m.score[0]?.o || 0)) < 0.1))
+  );
+  for (const m of stillEmpty.slice(0, 2)) {
+    try {
+      const fastHtml = await fetchHTMLFast(`https://www.cricbuzz.com/live-cricket-scores/${m.id}/cricket-match`);
+      const pageHtml = fastHtml || await axios.get(
+        `https://www.cricbuzz.com/live-cricket-scores/${m.id}/cricket-match`,
+        { headers: { 'User-Agent': 'Mozilla/5.0 AppleWebKit/537.36' }, timeout: 10000 }
+      ).then((r: any) => r.data).catch(() => null);
+      if (pageHtml) {
+        const extracted = extractScoreFromHTML(pageHtml);
+        if (extracted && extracted.score.length > 0) {
+          const idx = matches.findIndex((x: any) => x.id === m.id);
+          if (idx !== -1) {
+            matches[idx] = { ...matches[idx], score: extracted.score };
+            console.log(`[live] HTML score for ${m.id}: ${JSON.stringify(extracted.score)}`);
+          }
+        }
+      }
+    } catch(e: any) {}
+  }
 
   return matches;
 };
@@ -1103,7 +1209,16 @@ app.get(
             result.livescore = menuMatch[1].trim();
             console.log(`[score] id=${id} menu: "${result.update}"`);
           } else {
-            console.log(`[score] id=${id} EMPTY bodyLen:${bodyText.length} batters:${batters.length}`);
+          // Try HTML extraction (meta, title, __NEXT_DATA__)
+          const htmlExtracted = extractScoreFromHTML(html);
+          if (htmlExtracted && htmlExtracted.score.length > 0) {
+            const s0 = htmlExtracted.score[0];
+            result.livescore = `${s0.r}/${s0.w} (${s0.o} Ov)`;
+            (result as any).score = htmlExtracted.score;
+            console.log(`[score] id=${id} HTML extracted: ${result.livescore}`);
+          } else {
+                        console.log(`[score] id=${id} EMPTY bodyLen:${bodyText.length} batters:${batters.length}`);
+          }
           }
         }
       } else {
