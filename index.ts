@@ -977,7 +977,7 @@ app.get(
         livescore: miniResult.livescore,
         runrate: '',
       };
-      return res.json({ ...baseResult, ...miniResult });
+      res.json({ ...baseResult, ...miniResult }); return;
     }
 
     // SLOW PATH: Puppeteer fallback (only if JSON API failed)
@@ -1347,13 +1347,13 @@ app.get(
     // Try JSON API first — fastest
     const mini = await fetchCricbuzzMiniscore(matchId);
     if (mini?.score?.length > 0) {
-      return res.json({ success: true, matchId, ...mini });
+      res.json({ success: true, matchId, ...mini }); return;
     }
 
     // Try finding in live cache
     const cached = liveMatchCache.find((m: any) => String(m.id) === String(matchId));
     if (cached) {
-      return res.json({ success: true, matchId, ...cached });
+      res.json({ success: true, matchId, ...cached }); return;
     }
 
     // Try CricAPI if available
@@ -1369,7 +1369,7 @@ app.get(
           const scores = (j.data.score || []).map((s: any, i: number) => ({
             r: parseInt(s.r)||0, w: parseInt(s.w)||0, o: String(s.o||0), inning: i===0?'1st':'2nd'
           }));
-          return res.json({ success: true, matchId, score: scores, status: j.data.status, source: 'cricapi' });
+          res.json({ success: true, matchId, score: scores, status: j.data.status, source: 'cricapi' }); return;
         }
       } catch(e) {}
     }
@@ -1488,7 +1488,7 @@ app.get(
         };
         prematchCache[matchId] = { data: result, ts: Date.now() };
         console.log(`[prematch] ${matchId}: toss="${jsonMini.toss}" via JSON API`);
-        return res.json(result);
+        res.json(result); return;
       }
 
       // SLOW PATH: Puppeteer
